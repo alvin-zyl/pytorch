@@ -258,12 +258,13 @@ class Backend(str):  # noqa: SLOT000
     UCC = "ucc"
     MPI = "mpi"
     XCCL = "xccl"
+    ULFM = "ulfm"
 
     _BackendPlugin = namedtuple("_BackendPlugin", ["creator_fn", "extended_api"])
 
     _plugins: dict[str, _BackendPlugin] = {}
 
-    backend_list = [UNDEFINED, GLOO, NCCL, XCCL, UCC, MPI]
+    backend_list = [UNDEFINED, GLOO, NCCL, XCCL, UCC, MPI, ULFM]
 
     # 3rd-party devices can register the default backend support here
     default_device_backend_map: dict[str, str] = {
@@ -279,6 +280,7 @@ class Backend(str):  # noqa: SLOT000
         XCCL: ["xpu"],
         UCC: ["cpu", "cuda"],
         MPI: ["cpu", "cuda"],
+        ULFM: ["cpu", "cuda"],
     }
 
     backend_type_map: dict[str, ProcessGroup.BackendType] = {
@@ -288,6 +290,7 @@ class Backend(str):  # noqa: SLOT000
         XCCL: ProcessGroup.BackendType.XCCL,
         UCC: ProcessGroup.BackendType.UCC,
         MPI: ProcessGroup.BackendType.MPI,
+        ULFM: ProcessGroup.BackendType.MPI,
     }
 
     def __new__(cls, name: str):
@@ -1729,7 +1732,7 @@ def init_process_group(
     they provide as it not exposed in a public way.
     """
     group_name = _process_group_name([], use_hashed_name=False)
-    if backend == Backend.MPI:
+    if backend == Backend.MPI or backend == Backend.ULFM:
         if world_size != -1 or rank != -1:
             warnings.warn(
                 f"For MPI backend, world_size ({world_size}) and rank ({rank}) "
@@ -1814,7 +1817,7 @@ def init_process_group(
             "Performing barrier after ProcessGroup initialization since "
             "TORCH_DIST_INIT_BARRIER = 1"
         )
-        if backend == Backend.MPI:
+        if backend == Backend.MPI or backend == Backend.ULFM:
             # MPI backend doesn't use store.
             barrier()
         else:
@@ -1972,6 +1975,34 @@ def _new_process_group_helper(
                 )
             backend_class = ProcessGroupMPI.create(global_ranks_in_group)
             backend_type = ProcessGroup.BackendType.MPI
+            if not backend_class:
+                return GroupMember.NON_GROUP_MEMBER, None
+            # create new process group with accurate rank and size
+            if pg.rank() == -1 and pg.size() == -1:
+                pg = ProcessGroup(
+                    backend_prefix_store,
+                    backend_class.rank(),
+                    backend_class.size(),
+                )
+                pg._set_default_backend(backend_type)
+        elif backend_str == Backend.ULFM:
+            if not is_mpi_available():
+                raise RuntimeError(
+                    "Distributed package doesn't have MPI built in."
+                    " MPI is only included if you build PyTorch from"
+                    " source on a host that has MPI installed."
+                )
+
+            assert backend_str.upper() in Backend._plugins, (
+                f"Unknown c10d backend type {backend_str.upper()}"
+            )
+
+            backend_plugin = Backend._plugins[backend_str.upper()]
+            creator_fn = backend_plugin.creator_fn
+
+            backend_class = creator_fn(global_ranks_in_group)
+            backend_type = ProcessGroup.BackendType.CUSTOM
+
             if not backend_class:
                 return GroupMember.NON_GROUP_MEMBER, None
             # create new process group with accurate rank and size
@@ -5260,7 +5291,7 @@ def _new_group_with_tag(
 
     if use_local_synchronization:
         # MPI backend doesn't have have a way for us to perform a partial sync
-        if backend == Backend.MPI:
+        if backend == Backend.MPI or backend == Backend.ULFM:
             raise ValueError(
                 "MPI backend doesn't support use_local_synchronization=True"
             )
@@ -5327,7 +5358,7 @@ def _new_group_with_tag(
             "Performing barrier after ProcessGroup initialization since "
             "TORCH_DIST_INIT_BARRIER = 1"
         )
-        if backend == Backend.MPI:
+        if backend == Backend.MPI or backend == Backend.ULFM:
             # MPI doesn't have store.
             barrier()
         else:
