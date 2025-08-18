@@ -3,7 +3,7 @@ import torch
 from setuptools import setup
 from torch.utils import cpp_extension
 
-sources = ["src/ProcessGroupULFM.cpp"]
+sources = ["src/ProcessGroupULFM.cpp", "src/ULFMReducer.cpp", "src/bindings.cpp"]
 mpi_home = "/home/ziyueliu/openmpi-5.0.8-install"
 include_dirs = [f"{os.path.dirname(os.path.abspath(__file__))}/include/", f"{mpi_home}/include"]
 library_dirs = [f"{mpi_home}/lib"]
