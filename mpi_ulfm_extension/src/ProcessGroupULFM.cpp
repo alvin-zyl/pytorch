@@ -1,4 +1,5 @@
 #include "ProcessGroupULFM.hpp"
+#include "TypesULFM.hpp"
 
 // #ifdef USE_C10D_MPI
 
@@ -47,6 +48,75 @@ namespace c10d {
   } while (0)
 
 namespace {
+
+static bool get_failed_ranks(MPI_Comm comm,
+                             const int& rank,
+                             const int& size,
+                             std::vector<int>& failed_ranks_comm,
+                             std::vector<int>* failed_ranks_world = nullptr) {
+  failed_ranks_comm.clear();
+  if (failed_ranks_world) failed_ranks_world->clear();
+  
+  // MPI_Barrier(comm);
+  int flag = 1;
+  int rc_flag = MPIX_Comm_agree(comm, &flag);
+
+  int num_acked;
+  int rc_ack = MPIX_Comm_ack_failed(comm, size, &num_acked);
+  if (rc_ack != MPI_SUCCESS) {
+    fprintf(stderr, "[UFLM Rank %d] Fail to ack failures\n", rank);
+    return false;
+  }
+  
+  MPI_Group failed_grp = MPI_GROUP_NULL;
+  int rc_get = MPIX_Comm_get_failed(comm, &failed_grp);
+  if (rc_get != MPI_SUCCESS || failed_grp == MPI_GROUP_NULL) {
+    fprintf(stderr, "[UFLM Rank %d] Fail to get failed group\n", rank);
+    return false;
+  }
+
+  int fsize = 0;
+  MPI_Group_size(failed_grp, &fsize);
+  if (fsize <= 0) {
+    MPI_Group_free(&failed_grp);
+    std::string err = "[ULFM Rank " + std::to_string(rank) + "] Got failed group size " + std::to_string(fsize);
+    TORCH_CHECK(false, err);
+    return false; // nothing recorded yet
+  }
+
+  // Build index array 0..fsize-1 in the failed group's own indexing
+  std::vector<int> idx(fsize);
+  for (int i = 0; i < fsize; ++i) idx[i] = i;
+
+  // Translate to ranks in 'comm'
+  MPI_Group comm_grp = MPI_GROUP_NULL;
+  MPI_Comm_group(comm, &comm_grp);
+  failed_ranks_comm.resize(fsize);
+  MPI_Group_translate_ranks(failed_grp, fsize, idx.data(),
+                            comm_grp, failed_ranks_comm.data());
+  MPI_Group_free(&comm_grp);
+
+  fprintf(stderr, "[UFLM Rank %d] Number of failures acked %d\n", rank, num_acked);
+  std::string msg = "[ULFM Rank " + std::to_string(rank) + "] Failed ranks in comm: ";
+  for (int i = 0; i < fsize; ++i) {
+    msg += std::to_string(failed_ranks_comm[i]) + " ";
+  }
+  msg += "\n";
+  fprintf(stderr, "%s", msg.c_str());
+
+  // Optionally translate to MPI_COMM_WORLD ranks
+  if (failed_ranks_world) {
+    MPI_Group world_grp = MPI_GROUP_NULL;
+    MPI_Comm_group(MPI_COMM_WORLD, &world_grp);
+    failed_ranks_world->resize(fsize);
+    MPI_Group_translate_ranks(failed_grp, fsize, idx.data(),
+                              world_grp, failed_ranks_world->data());
+    MPI_Group_free(&world_grp);
+  }
+
+  MPI_Group_free(&failed_grp);
+  return true;
+}
 
 // Op mapping
 std::map<ReduceOp::RedOpType, MPI_Op> mpiOp = {
@@ -278,7 +348,7 @@ void ProcessGroupULFM::initMPIOnce() {
   }();
 }
 
-c10::intrusive_ptr<Backend> ProcessGroupULFM::createProcessGroupULFM(
+c10::intrusive_ptr<ProcessGroup> ProcessGroupULFM::createProcessGroupULFM(
     std::vector<int> ranks) {
   // Once initialization
   initMPIOnce();
@@ -337,7 +407,7 @@ c10::intrusive_ptr<Backend> ProcessGroupULFM::createProcessGroupULFM(
 }
 
 ProcessGroupULFM::ProcessGroupULFM(int rank, int size, MPI_Comm pgComm)
-    : Backend(rank, size), stop_(false), pgComm_(pgComm) {
+    : ProcessGroup(rank, size), stop_(false), pgComm_(pgComm) {
   if (pgComm_ == MPI_COMM_NULL) {
     TORCH_CHECK(false, "pgComm_ must not be MPI_COMM_NULL");
   }
@@ -451,6 +521,52 @@ c10::intrusive_ptr<Work> ProcessGroupULFM::allreduce(
         auto data = (entry->src)[0];
         c10::DeviceGuard guard(data.device());
         std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
+        MPI_CHECK(MPI_Allreduce(
+            MPI_IN_PLACE,
+            data.data_ptr(),
+            data.numel(),
+            mpiDatatype.at(data.scalar_type()),
+            mpiOp.at(opts.reduceOp),
+            pgComm_));
+      };
+  auto entry =
+      std::make_unique<WorkEntry>(&tensors, &tensors, std::move(runFunc));
+  return enqueue(
+      std::move(entry),
+      "mpi:all_reduce",
+      std::optional<std::vector<at::Tensor>>(tensors));
+}
+
+c10::intrusive_ptr<Work> ProcessGroupULFM::ulfm_allreduce(
+    std::vector<at::Tensor>& tensors,
+    const AllreduceOptions& opts,
+    const ULFMOptions& ulfm_opts) {
+  
+  checkSingleTensor(tensors);
+
+  std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
+      [opts, ulfm_opts, this](std::unique_ptr<WorkEntry>& entry) {
+        auto data = (entry->src)[0];
+        c10::DeviceGuard guard(data.device());
+        std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
+        int flag = 1, rc, cls;
+        rc = MPIX_Comm_agree(pgComm_, &flag); 
+        MPI_Error_class(rc, &cls);
+        if (cls == MPIX_ERR_PROC_FAILED || cls == MPIX_ERR_REVOKED) {
+          std::vector<int> failed_in_comm, failed_in_world;
+          get_failed_ranks(pgComm_, rank_, size_, failed_in_comm, &failed_in_world);
+          // MPI_CHECK(MPIX_Comm_agree(pgComm_, &flag));
+          if (ulfm_opts.auto_repair) {
+            MPI_Comm new_comm;
+            MPIX_Comm_shrink(pgComm_, &new_comm);
+            MPI_Comm_free(&pgComm_);
+            pgComm_ = new_comm;
+            int curr_rank;
+            MPI_Comm_rank(pgComm_, &curr_rank);
+            fprintf(stderr, "[UFLM Rank %d] New rank is %d\n", rank_, curr_rank);
+          }
+        };
+        printf("[Rank %d] ULFM All Reduce\n", rank_);
         ULFM_MPI_CHECK(MPI_Allreduce(
             MPI_IN_PLACE,
             data.data_ptr(),
@@ -1069,11 +1185,6 @@ c10::intrusive_ptr<Work> ProcessGroupULFM::_reduce_scatter_base(
       "mpi:_reduce_scatter_base",
       std::optional<std::vector<at::Tensor>>(inputTensors));
 }
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("createProcessGroupULFM", &ProcessGroupULFM::createProcessGroupULFM);
-}
-
 } // namespace c10d
 
 // #endif // USE_C10D_MPI

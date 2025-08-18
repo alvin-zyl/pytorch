@@ -1661,9 +1661,9 @@ def init_process_group(
     if "torch._dynamo" in sys.modules:
         torch._dynamo.trace_rules.clear_lru_cache()
 
-    assert (store is None) or (init_method is None), (
-        "Cannot specify both init_method and store."
-    )
+    assert (store is None) or (
+        init_method is None
+    ), "Cannot specify both init_method and store."
 
     if store is not None:
         assert world_size > 0, "world_size must be positive if using store"
@@ -1779,8 +1779,7 @@ def init_process_group(
         _update_default_pg(default_pg)
 
     _world.pg_group_ranks[GroupMember.WORLD] = {  # type: ignore[index]
-        i: i
-        for i in range(GroupMember.WORLD.size())  # type: ignore[attr-defined]
+        i: i for i in range(GroupMember.WORLD.size())  # type: ignore[attr-defined]
     }
     _backend = _world.pg_map[not_none(GroupMember.WORLD)][0]
     _default_pg_init_method = init_method
@@ -1993,9 +1992,9 @@ def _new_process_group_helper(
                     " source on a host that has MPI installed."
                 )
 
-            assert backend_str.upper() in Backend._plugins, (
-                f"Unknown c10d backend type {backend_str.upper()}"
-            )
+            assert (
+                backend_str.upper() in Backend._plugins
+            ), f"Unknown c10d backend type {backend_str.upper()}"
 
             backend_plugin = Backend._plugins[backend_str.upper()]
             creator_fn = backend_plugin.creator_fn
@@ -2029,9 +2028,9 @@ def _new_process_group_helper(
             if not is_nccl_available():
                 raise RuntimeError("Distributed package doesn't have NCCL built in")
             if backend_options is not None:
-                assert isinstance(backend_options, ProcessGroupNCCL.Options), (
-                    "Expected backend_options argument to be of type ProcessGroupNCCL.Options"
-                )
+                assert isinstance(
+                    backend_options, ProcessGroupNCCL.Options
+                ), "Expected backend_options argument to be of type ProcessGroupNCCL.Options"
                 if backend_options._timeout != timeout:
                     warnings.warn(
                         "backend_options._timeout was specified, "
@@ -2071,9 +2070,9 @@ def _new_process_group_helper(
             )
             backend_type = ProcessGroup.BackendType.XCCL
         else:
-            assert backend_str.upper() in Backend._plugins, (
-                f"Unknown c10d backend type {backend_str.upper()}"
-            )
+            assert (
+                backend_str.upper() in Backend._plugins
+            ), f"Unknown c10d backend type {backend_str.upper()}"
 
             backend_plugin = Backend._plugins[backend_str.upper()]
             creator_fn = backend_plugin.creator_fn
@@ -2966,6 +2965,113 @@ def all_reduce(tensor, op=ReduceOp.SUM, group=None, async_op=False):
 
 
 @_exception_logger
+def ulfm_all_reduce(
+    tensor, op=ReduceOp.SUM, group=None, async_op=False, ulfm_opts=None
+):
+    """
+    Reduces the tensor data across all machines in a way that all get the final result.
+
+    After the call ``tensor`` is going to be bitwise identical in all processes.
+
+    Complex tensors are supported.
+
+    Args:
+        tensor (Tensor): Input and output of the collective. The function
+            operates in-place.
+        op (optional): One of the values from
+            ``torch.distributed.ReduceOp``
+            enum.  Specifies an operation used for element-wise reductions.
+        group (ProcessGroup, optional): The process group to work on. If None,
+            the default process group will be used.
+        async_op (bool, optional): Whether this op should be an async op
+
+    Returns:
+        Async work handle, if async_op is set to True.
+        None, if not async_op or if not part of the group
+
+    Examples:
+        >>> # xdoctest: +SKIP("no rank")
+        >>> # All tensors below are of torch.int64 type.
+        >>> # We have 2 process groups, 2 ranks.
+        >>> device = torch.device(f"cuda:{rank}")
+        >>> tensor = torch.arange(2, dtype=torch.int64, device=device) + 1 + 2 * rank
+        >>> tensor
+        tensor([1, 2], device='cuda:0') # Rank 0
+        tensor([3, 4], device='cuda:1') # Rank 1
+        >>> dist.all_reduce(tensor, op=ReduceOp.SUM)
+        >>> tensor
+        tensor([4, 6], device='cuda:0') # Rank 0
+        tensor([4, 6], device='cuda:1') # Rank 1
+
+        >>> # All tensors below are of torch.cfloat type.
+        >>> # We have 2 process groups, 2 ranks.
+        >>> tensor = torch.tensor(
+        ...     [1 + 1j, 2 + 2j], dtype=torch.cfloat, device=device
+        ... ) + 2 * rank * (1 + 1j)
+        >>> tensor
+        tensor([1.+1.j, 2.+2.j], device='cuda:0') # Rank 0
+        tensor([3.+3.j, 4.+4.j], device='cuda:1') # Rank 1
+        >>> dist.all_reduce(tensor, op=ReduceOp.SUM)
+        >>> tensor
+        tensor([4.+4.j, 6.+6.j], device='cuda:0') # Rank 0
+        tensor([4.+4.j, 6.+6.j], device='cuda:1') # Rank 1
+
+    """
+    # Dynamo has built-in logic to map legacy distributed ops to functional collectives.
+    # Let's redirect to a torch function mode that can mimic this logic outside Dynamo
+    # (e.g., non-strict export implements such a torch function mode).
+    relevant_args = (tensor,)
+    if has_torch_function(relevant_args):
+        return handle_torch_function(
+            all_reduce,
+            relevant_args,
+            tensor,
+            op=op,
+            group=group,
+            async_op=async_op,
+        )
+
+    _check_single_tensor(tensor, "tensor")
+    if _rank_not_in_group(group):
+        _warn_not_in_group("all_reduce")
+        return
+
+    if tensor.is_complex():
+        if not supports_complex(op):
+            raise ValueError(f"all_reduce does not support {op} on complex tensors")
+        tensor = torch.view_as_real(tensor)
+
+    opts = AllreduceOptions()
+    opts.reduceOp = op
+    opts.asyncOp = async_op
+    if group is None:
+        group = _get_default_group()
+
+    if group in _world.pg_coalesce_state.keys():
+        # We are in coalescing context, do not issue single operation, just append a collective representation
+        coll = _CollOp(all_reduce, tensor, None, op, None)
+        _world.pg_coalesce_state[group].append(coll)
+        if async_op:
+            return _IllegalWork()
+        else:
+            return None
+
+    work = (
+        group.ulfm_allreduce([tensor], opts)
+        if ulfm_opts is None
+        else group.ulfm_allreduce([tensor], opts, ulfm_opts)
+    )
+
+    if async_op:
+        return work
+    elif (
+        work is not None
+    ):  # Backward compatible with backends that don't sync at CPP level
+        work.wait()
+    # Otherwise, the backend has sync'ed at CPP level
+
+
+@_exception_logger
 @deprecated(
     "`torch.distributed.all_reduce_coalesced` will be deprecated. If you must "
     "use it, please revisit our documentation later at "
@@ -3543,9 +3649,9 @@ def recv_object_list(
     )
 
     rank_objects = recv(object_tensor, src=src, group=group, group_src=group_src)
-    assert rank_sizes == rank_objects, (
-        "Mismatch in return ranks for object sizes and objects."
-    )
+    assert (
+        rank_sizes == rank_objects
+    ), "Mismatch in return ranks for object sizes and objects."
     # Deserialize objects using their stored sizes.
     offset = 0
     for i, obj_size in enumerate(object_sizes_tensor):
@@ -5136,9 +5242,9 @@ def split_group(
     split_pg.bound_device_id = device_id  # type: ignore[union-attr]
     split_backend_class = split_pg._get_backend(torch.device("cuda"))
     split_backend_class._set_sequence_number_for_group()
-    assert split_pg.group_name == group_name, (
-        f"group name should be set to {group_name} but got {split_pg.group_name}"
-    )
+    assert (
+        split_pg.group_name == group_name
+    ), f"group name should be set to {group_name} but got {split_pg.group_name}"
 
     # update global state
     _world.pg_map[split_pg] = (backend, split_pg.get_group_store())
@@ -5270,9 +5376,9 @@ def _new_group_with_tag(
     if device_id is None:
         device_id = default_pg.bound_device_id
     elif default_pg.bound_device_id is not None:
-        assert device_id == default_pg.bound_device_id, (
-            "Mismatched bound device between new pg and the default pg."
-        )
+        assert (
+            device_id == default_pg.bound_device_id
+        ), "Mismatched bound device between new pg and the default pg."
     default_backend, default_store = _world.pg_map[default_pg]
     global_rank = default_pg.rank()
     global_world_size = default_pg.size()
@@ -5586,9 +5692,9 @@ def _find_pg_by_ranks_and_tag(tag: str, ranks: list[int]) -> Optional[ProcessGro
 def _find_or_create_pg_by_ranks_and_tag(
     tag: str, ranks: list[int], stride: int
 ) -> ProcessGroup:
-    assert len(ranks) % stride == 0, (
-        f"Ranks length ({len(ranks)}) must be divisible by stride ({stride})"
-    )
+    assert (
+        len(ranks) % stride == 0
+    ), f"Ranks length ({len(ranks)}) must be divisible by stride ({stride})"
 
     my_rank = get_rank()
     my_ranks = None

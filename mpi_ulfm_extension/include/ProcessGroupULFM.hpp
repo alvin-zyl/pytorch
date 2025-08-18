@@ -14,6 +14,7 @@
 #include <ATen/core/ivalue_inl.h>
 
 #include <torch/csrc/distributed/c10d/Backend.hpp>
+#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/csrc/distributed/c10d/Utils.hpp>
@@ -21,6 +22,7 @@
 #include <mpi.h>
 #include <torch/python.h>
 #include <pybind11/chrono.h>
+#include "TypesULFM.hpp"
 
 namespace c10d {
 
@@ -80,7 +82,7 @@ struct WorkEntry {
 //
 // CUDA tensor can be supported if the MPI used is CUDA-aware MPI, and
 // ProcessGroupMPI will automatically detect this support.
-class TORCH_API ProcessGroupULFM : public Backend {
+class TORCH_API ProcessGroupULFM : public ProcessGroup {
  public:
   class WorkMPI : public Work {
    public:
@@ -161,6 +163,12 @@ class TORCH_API ProcessGroupULFM : public Backend {
       std::vector<at::Tensor>& tensors,
       const AllreduceOptions& opts = AllreduceOptions()) override;
 
+  c10::intrusive_ptr<Work> ulfm_allreduce(
+      std::vector<at::Tensor>& tensors,
+      const AllreduceOptions& opts = AllreduceOptions(),
+      const ULFMOptions& ulfm_opts = ULFMOptions()
+    );
+
   c10::intrusive_ptr<Work> allreduce_coalesced(
       std::vector<at::Tensor>& tensors,
       const AllreduceCoalescedOptions& opts =
@@ -235,7 +243,7 @@ class TORCH_API ProcessGroupULFM : public Backend {
       const BarrierOptions& opts = BarrierOptions()) override;
 
   // Creating a new ProcessGroupMPI, will initialize MPI if not initialized
-  static c10::intrusive_ptr<Backend> createProcessGroupULFM(
+  static c10::intrusive_ptr<ProcessGroup> createProcessGroupULFM(
       std::vector<int> ranks = {});
 
   static void ProcessGroupULFMConstructor() __attribute__((constructor)) {
