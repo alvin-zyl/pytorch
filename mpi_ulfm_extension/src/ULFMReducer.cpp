@@ -115,47 +115,11 @@ c10::intrusive_ptr<ProcessGroupULFM> ULFMCommHook::get_ulfm_process_group() cons
   return state_;
 }
 
-// Convenience function to create a Reducer with ULFM hook  
-std::shared_ptr<Reducer> create_ulfm_reducer(
-    std::vector<at::Tensor> params,
-    std::vector<std::vector<size_t>> bucket_indices,
+// Function to create ULFM communication hook
+std::unique_ptr<ULFMCommHook> create_ulfm_hook(
     c10::intrusive_ptr<ProcessGroupULFM> process_group,
-    std::vector<bool> expect_sparse_gradients,
-    int64_t bucket_bytes_cap,
-    bool find_unused_parameters,
-    bool gradient_as_bucket_view,
-    std::unordered_map<size_t, std::string> param_names,
-    int64_t first_bucket_bytes_cap,
-    bool skip_all_reduce_unused_params,
-    bool use_python_reducer,
     ULFMFailureHandlingStrategy failure_strategy) {
-    
-  try {
-    auto reducer = std::make_unique<Reducer>(
-        params,
-        bucket_indices,
-        process_group,
-        expect_sparse_gradients,
-        bucket_bytes_cap,
-        find_unused_parameters,
-        gradient_as_bucket_view,
-        param_names,
-        first_bucket_bytes_cap,
-        skip_all_reduce_unused_params,
-        use_python_reducer);
-        
-    // Create and register the ULFM communication hook
-    auto ulfm_hook = std::make_unique<ULFMCommHook>(process_group, failure_strategy);
-    reducer->register_comm_hook(std::move(ulfm_hook));    
-    return reducer;
-    
-  } catch (const std::exception& e) {
-    printf("Exception in create_ulfm_reducer: %s\n", e.what());
-    throw;
-  } catch (...) {
-    printf("Unknown exception in create_ulfm_reducer\n");
-    throw;
-  }
+  return std::make_unique<ULFMCommHook>(process_group, failure_strategy);
 }
 
 } // namespace c10d

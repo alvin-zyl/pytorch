@@ -12,8 +12,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("createProcessGroupULFM", &c10d::ProcessGroupULFM::createProcessGroupULFM);
 
   py::class_<c10d::ULFMOptions>(m, "ULFMOptions")
-      .def(py::init<bool>(), py::arg("auto_repair") = false)
-      .def_readwrite("auto_repair", &c10d::ULFMOptions::auto_repair);
+      .def(py::init<>())
+      .def_readwrite("auto_repair", &c10d::ULFMOptions::auto_repair)
+      .def_readwrite("failure_strategy", &c10d::ULFMOptions::failure_strategy)
+      .def_readwrite("max_retries", &c10d::ULFMOptions::max_retries)
+      .def_readwrite("retry_delay_ms", &c10d::ULFMOptions::retry_delay_ms);
 
   py::enum_<c10d::ULFMFailureHandlingStrategy>(m, "ULFMFailureHandlingStrategy")
       .value("CONTINUE_WITH_SURVIVORS", c10d::ULFMFailureHandlingStrategy::CONTINUE_WITH_SURVIVORS)
@@ -40,49 +43,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   // Note: Reducer class is already bound by PyTorch
 
-  m.def("create_ulfm_reducer", [](
-      std::vector<at::Tensor> params,
-      std::vector<std::vector<size_t>> bucket_indices,
-      c10::intrusive_ptr<c10d::ProcessGroupULFM> process_group,  // Accept ProcessGroupULFM directly
-      std::vector<bool> expect_sparse_gradients,
-      int64_t bucket_bytes_cap = 25 * 1024 * 1024,
-      bool find_unused_parameters = false,
-      bool gradient_as_bucket_view = false,
-      std::unordered_map<size_t, std::string> param_names = {},
-      int64_t first_bucket_bytes_cap = 1024 * 1024,
-      bool skip_all_reduce_unused_params = false,
-      bool use_python_reducer = false,
+  m.def("create_ulfm_hook", [](
+      c10::intrusive_ptr<c10d::ProcessGroupULFM> process_group,
       c10d::ULFMFailureHandlingStrategy failure_strategy = c10d::ULFMFailureHandlingStrategy::CONTINUE_WITH_SURVIVORS
   ) {      
-      auto reducer = c10d::create_ulfm_reducer(
-          params,
-          bucket_indices,
-          process_group,  // No casting needed - it's already ProcessGroupULFM!
-          expect_sparse_gradients,
-          bucket_bytes_cap,
-          find_unused_parameters,
-          gradient_as_bucket_view,
-          param_names,
-          first_bucket_bytes_cap,
-          skip_all_reduce_unused_params,
-          use_python_reducer,
-          failure_strategy
-      );
-      
-      return reducer;
+      return c10d::create_ulfm_hook(process_group, failure_strategy);
   },
-      py::arg("params"),
-      py::arg("bucket_indices"),
       py::arg("process_group"),
-      py::arg("expect_sparse_gradients"),
-      py::arg("bucket_bytes_cap") = 25 * 1024 * 1024,
-      py::arg("find_unused_parameters") = false,
-      py::arg("gradient_as_bucket_view") = false,
-      py::arg("param_names") = std::unordered_map<size_t, std::string>{},
-      py::arg("first_bucket_bytes_cap") = 1024 * 1024,
-      py::arg("skip_all_reduce_unused_params") = false,
-      py::arg("use_python_reducer") = false,
       py::arg("failure_strategy") = c10d::ULFMFailureHandlingStrategy::CONTINUE_WITH_SURVIVORS,
-      "Create a PyTorch Reducer with ULFM communication hook",
+      "Create ULFM communication hook for use with PyTorch DDP",
       py::return_value_policy::automatic);
 }

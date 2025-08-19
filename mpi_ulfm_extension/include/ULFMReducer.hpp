@@ -33,19 +33,9 @@ class ULFMCommHook : public CppCommHookInterface<c10::intrusive_ptr<ProcessGroup
   c10::intrusive_ptr<ProcessGroupULFM> get_ulfm_process_group() const;
 };
 
-// Convenience function to create a Reducer with ULFM hook
-TORCH_API std::shared_ptr<Reducer> create_ulfm_reducer(
-    std::vector<at::Tensor> params,
-    std::vector<std::vector<size_t>> bucket_indices,
+// Function to create ULFM communication hook
+TORCH_API std::unique_ptr<ULFMCommHook> create_ulfm_hook(
     c10::intrusive_ptr<ProcessGroupULFM> process_group,
-    std::vector<bool> expect_sparse_gradients,
-    int64_t bucket_bytes_cap,
-    bool find_unused_parameters,
-    bool gradient_as_bucket_view,
-    std::unordered_map<size_t, std::string> param_names,
-    int64_t first_bucket_bytes_cap,
-    bool skip_all_reduce_unused_params,
-    bool use_python_reducer = false,
     ULFMFailureHandlingStrategy failure_strategy = ULFMFailureHandlingStrategy::CONTINUE_WITH_SURVIVORS);
 
 } // namespace c10d
