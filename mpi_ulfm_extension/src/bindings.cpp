@@ -5,6 +5,7 @@
 #include "ProcessGroupULFM.hpp"
 #include "TypesULFM.hpp"
 #include "ULFMReducer.hpp"
+#include "ULFMLogging.hpp"
 
 namespace py = pybind11;
 
@@ -27,7 +28,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("ulfm_allreduce", &c10d::ProcessGroupULFM::ulfm_allreduce,
       py::arg("tensors"),
       py::arg("opts") = c10d::AllreduceOptions(),
-      py::arg("ulfm_opts") = c10d::ULFMOptions());
+      py::arg("ulfm_opts") = c10d::ULFMOptions())
+      .def("repair_communicator", &c10d::ProcessGroupULFM::repair_communicator)
+      .def("notify_all_ranks_of_failure", &c10d::ProcessGroupULFM::notify_all_ranks_of_failure)
+      .def("check_for_failures", &c10d::ProcessGroupULFM::check_for_failures)
+      .def("detect_and_recover_failures", [](c10d::ProcessGroupULFM& self, bool auto_repair) {
+          std::vector<int> failed_ranks;
+          bool success = self.detect_and_recover_failures(auto_repair, &failed_ranks);
+          return py::make_tuple(success, failed_ranks);
+      }, py::arg("auto_repair") = true, 
+         "Comprehensive failure detection and recovery workflow. Returns (success, failed_ranks)");
+
+  py::class_<c10d::ProcessGroupULFM::WorkULFM, c10d::Work, c10::intrusive_ptr<c10d::ProcessGroupULFM::WorkULFM>>(m, "WorkULFM")
+      .def("has_failures", &c10d::ProcessGroupULFM::WorkULFM::has_failures)
+      .def("get_failed_ranks", &c10d::ProcessGroupULFM::WorkULFM::get_failed_ranks);
 
   py::class_<c10d::ULFMCommHook>(m, "ULFMCommHook")
       .def(py::init<
@@ -53,4 +67,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("failure_strategy") = c10d::ULFMFailureHandlingStrategy::CONTINUE_WITH_SURVIVORS,
       "Create ULFM communication hook for use with PyTorch DDP",
       py::return_value_policy::automatic);
+
+  // ULFM logging control
+  m.def("set_ulfm_verbose_logging", &c10d::set_ulfm_verbose_logging, 
+        py::arg("verbose"), 
+        "Enable or disable verbose ULFM logging");
+  
+  m.def("is_ulfm_verbose_logging", &c10d::is_ulfm_verbose_logging, 
+        "Check if verbose ULFM logging is enabled");
 }

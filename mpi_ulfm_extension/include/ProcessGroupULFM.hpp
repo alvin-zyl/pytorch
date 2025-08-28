@@ -56,6 +56,9 @@ struct WorkEntry {
   // src rank returned, for recv only
   int* srcRank = nullptr;
   std::function<void(std::unique_ptr<WorkEntry>&)> run;
+  
+  // For ULFM work entries - pointer to WorkULFM for failure recording  
+  void* ulfmWork = nullptr;
 };
 
 // ProcessGroupMPI implements MPI bindings for c10d.
@@ -109,6 +112,30 @@ class TORCH_API ProcessGroupULFM : public ProcessGroup {
 
     std::vector<at::Tensor> outputTensors_;
     c10::intrusive_ptr<at::ivalue::Future> future_;
+  };
+
+  class WorkULFM : public WorkMPI {
+   public:
+    explicit WorkULFM(
+        std::vector<at::Tensor> outputTensors,
+        const char* profilingTitle = nullptr,
+        const std::optional<std::vector<at::Tensor>>& inputTensors =
+            std::nullopt)
+        : WorkMPI(std::move(outputTensors), profilingTitle, inputTensors),
+          hasFailures_(false) {}
+
+    // Failure detection methods (no recovery)
+    bool has_failures() const;
+    std::vector<int> get_failed_ranks() const;
+
+   protected:
+    friend class ProcessGroupULFM;
+    void recordFailure(const std::vector<int>& failedRanks);
+
+   private:
+    mutable std::mutex failureMutex_;
+    bool hasFailures_;
+    std::vector<int> failedRanks_;
   };
 
   class AsyncWork : public Work {
@@ -168,6 +195,14 @@ class TORCH_API ProcessGroupULFM : public ProcessGroup {
       const AllreduceOptions& opts = AllreduceOptions(),
       const ULFMOptions& ulfm_opts = ULFMOptions()
     );
+
+  // Recovery methods (ProcessGroup-level operations)
+  bool repair_communicator();
+  void notify_all_ranks_of_failure();
+  bool check_for_failures() const;
+  
+  // Comprehensive failure detection and recovery workflow
+  bool detect_and_recover_failures(bool auto_repair = true, std::vector<int>* failed_ranks = nullptr);
 
   c10::intrusive_ptr<Work> allreduce_coalesced(
       std::vector<at::Tensor>& tensors,
@@ -261,7 +296,21 @@ class TORCH_API ProcessGroupULFM : public ProcessGroup {
   // Helper function that is called by the destructor
   void destroy();
 
+  // Modular failure recovery helper methods (corrected workflow order)
+  bool notice_failure();
+  bool get_failed_ranks_internal(std::vector<int>& failed_ranks_comm, std::vector<int>* failed_ranks_world = nullptr);
+  bool ack_failures();
+  bool agree_on_failed_ranks(const std::vector<int>& failed_ranks);
+  bool should_repair_communicator(const std::vector<int>& failed_ranks);
+  bool repair_communicator_internal();
+
   c10::intrusive_ptr<Work> enqueue(
+      std::unique_ptr<WorkEntry> entry,
+      const char* profilingTitle = nullptr,
+      const std::optional<std::vector<at::Tensor>>& inputTensors =
+          std::nullopt);
+
+  c10::intrusive_ptr<WorkULFM> enqueueULFM(
       std::unique_ptr<WorkEntry> entry,
       const char* profilingTitle = nullptr,
       const std::optional<std::vector<at::Tensor>>& inputTensors =
@@ -284,6 +333,8 @@ class TORCH_API ProcessGroupULFM : public ProcessGroup {
   static int mpiThreadSupport_;
 
   MPI_Comm pgComm_;
+  int currentRank_;  // Current rank after repairs (may change)
+  int currentSize_;  // Current size after repairs (may change)
 };
 
 } // namespace c10d

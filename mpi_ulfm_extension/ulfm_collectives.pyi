@@ -2,7 +2,7 @@
 # mypy: disable-error-code="type-arg"
 from datetime import timedelta
 from enum import Enum
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, Tuple
 
 import torch
 from torch import Tensor
@@ -25,13 +25,59 @@ class ULFMOptions:
     
     def __init__(self) -> None: ...
 
+class WorkULFM(Work):
+    """ULFM-aware Work class for failure detection (no recovery logic)."""
+    def has_failures(self) -> bool: 
+        """Check if this work detected any failures."""
+        ...
+    
+    def get_failed_ranks(self) -> list[int]: 
+        """Get list of ranks that failed during this work."""
+        ...
+
 class ProcessGroupULFM(ProcessGroup):
     def ulfm_allreduce(
         self,
         tensors: list[Tensor],
         opts: AllreduceOptions = ...,
         ulfm_opts: ULFMOptions = ...
-    ) -> Work: ...
+    ) -> WorkULFM: ...
+    
+    # Legacy recovery methods (backward compatibility)
+    def repair_communicator(self) -> bool:
+        """Legacy method: repair the MPI communicator after failures."""
+        ...
+    
+    def notify_all_ranks_of_failure(self) -> None:
+        """Legacy method: notify all ranks of detected failures."""
+        ...
+    
+    def check_for_failures(self) -> bool:
+        """Legacy method: check if there are any detected failures."""
+        ...
+    
+    # New modular failure recovery system
+    def detect_and_recover_failures(
+        self, 
+        auto_repair: bool = True
+    ) -> Tuple[bool, list[int]]:
+        """
+        Comprehensive 5-step failure detection and recovery workflow.
+        
+        Follows ULFM best practices:
+        1. Notice failure (comm_agree first)
+        2. Get failed ranks (while communicator is revoked)
+        3. Ack failures (MUST come before collective operations)
+        4. Agree on failed ranks (now safe after ack)
+        5. Repair communicator if needed and requested
+        
+        Args:
+            auto_repair: Whether to automatically repair the communicator
+        
+        Returns:
+            Tuple of (success: bool, failed_ranks: list[int])
+        """
+        ...
 
 class ULFMCommHook:
     def __init__(
@@ -49,3 +95,12 @@ def create_ulfm_hook(
     process_group: ProcessGroupULFM,
     failure_strategy: ULFMFailureHandlingStrategy = ULFMFailureHandlingStrategy.CONTINUE_WITH_SURVIVORS
 ) -> ULFMCommHook: ...
+
+# ULFM logging control
+def set_ulfm_verbose_logging(verbose: bool) -> None:
+    """Enable or disable verbose ULFM logging."""
+    ...
+
+def is_ulfm_verbose_logging() -> bool:
+    """Check if verbose ULFM logging is enabled."""
+    ...

@@ -1,5 +1,6 @@
 #include "ProcessGroupULFM.hpp"
 #include "TypesULFM.hpp"
+#include "ULFMLogging.hpp"
 
 // #ifdef USE_C10D_MPI
 
@@ -27,7 +28,7 @@ namespace c10d {
     }                                                                    \
   } while (0)
 
-#define ULFM_MPI_CHECK(cmd)                                              \
+#define ULFM_MPI_CHECK(cmd, rank)                                       \
   do {                                                                   \
     int mpiStatus = cmd;                                                 \
     if (mpiStatus != MPI_SUCCESS) {                                      \
@@ -35,9 +36,7 @@ namespace c10d {
       MPI_Error_class(mpiStatus, &errClass);                             \
       if (errClass == MPIX_ERR_PROC_FAILED) {                            \
         /* Process failure detected, do not terminate */                 \
-        fprintf(stderr, "[ULFM] Detected process failure at %s:%d\n",    \
-                __FILE__, __LINE__);                                     \
-        fflush(stderr);                                                  \
+        ULFM_LOG_WARN(rank, "Process failure detected at " << __FILE__ << ":" << __LINE__); \
         break;                                                           \
       }                                                                  \
       std::string err = "MPI error in: " + std::string(__FILE__) + ":" + \
@@ -64,14 +63,14 @@ static bool get_failed_ranks(MPI_Comm comm,
   int num_acked;
   int rc_ack = MPIX_Comm_ack_failed(comm, size, &num_acked);
   if (rc_ack != MPI_SUCCESS) {
-    fprintf(stderr, "[UFLM Rank %d] Fail to ack failures\n", rank);
+    ULFM_LOG_ERROR(rank, "Failed to ack failures");
     return false;
   }
   
   MPI_Group failed_grp = MPI_GROUP_NULL;
   int rc_get = MPIX_Comm_get_failed(comm, &failed_grp);
   if (rc_get != MPI_SUCCESS || failed_grp == MPI_GROUP_NULL) {
-    fprintf(stderr, "[UFLM Rank %d] Fail to get failed group\n", rank);
+    ULFM_LOG_ERROR(rank, "Failed to get failed group");
     return false;
   }
 
@@ -96,13 +95,19 @@ static bool get_failed_ranks(MPI_Comm comm,
                             comm_grp, failed_ranks_comm.data());
   MPI_Group_free(&comm_grp);
 
-  fprintf(stderr, "[UFLM Rank %d] Number of failures acked %d\n", rank, num_acked);
-  std::string msg = "[ULFM Rank " + std::to_string(rank) + "] Failed ranks in comm: ";
-  for (int i = 0; i < fsize; ++i) {
-    msg += std::to_string(failed_ranks_comm[i]) + " ";
+  ULFM_LOG_DEBUG(rank, "Number of failures acked: " << num_acked);
+  if (is_ulfm_verbose_logging() && fsize > 0) {
+    std::ostringstream oss;
+    oss << "Failed ranks in comm: ";
+    for (int i = 0; i < fsize; ++i) {
+      if (i > 0) oss << ", ";
+      oss << failed_ranks_comm[i];
+    }
+    std::string debug_msg = oss.str();
+    if (!debug_msg.empty() && debug_msg != "Failed ranks in comm: ") {
+      ULFM_LOG_DEBUG(rank, debug_msg);
+    }
   }
-  msg += "\n";
-  fprintf(stderr, "%s", msg.c_str());
 
   // Optionally translate to MPI_COMM_WORLD ranks
   if (failed_ranks_world) {
@@ -411,7 +416,7 @@ ProcessGroupULFM::ProcessGroupULFM(int rank, int size, MPI_Comm pgComm)
   if (pgComm_ == MPI_COMM_NULL) {
     TORCH_CHECK(false, "pgComm_ must not be MPI_COMM_NULL");
   }
-  std::cout << "[ULFM MPI Constructor] MPI rank " << rank << " size " << size << std::endl << std::flush;
+  ULFM_LOG_WARN(rank, "MPI Constructor initialized with rank " << rank << ", size " << size);
 
   // Start the worker thread accepting MPI calls
   workerThread_ = std::thread(&ProcessGroupULFM::runLoop, this);
@@ -486,6 +491,40 @@ c10::intrusive_ptr<Work> ProcessGroupULFM::enqueue(
   return work;
 }
 
+c10::intrusive_ptr<ProcessGroupULFM::WorkULFM> ProcessGroupULFM::enqueueULFM(
+    std::unique_ptr<WorkEntry> entry,
+    const char* profilingTitle,
+    const std::optional<std::vector<at::Tensor>>& inputTensors) {
+  auto work =
+      c10::make_intrusive<WorkULFM>(entry->dst, profilingTitle, inputTensors);
+  
+  // Store work pointer in entry for access in runFunc
+  entry->ulfmWork = static_cast<void*>(work.get());
+  
+  std::unique_lock<std::mutex> lock(pgMutex_);
+  queue_.emplace_back(std::move(entry), work);
+  lock.unlock();
+  queueProduceCV_.notify_one();
+  return work;
+}
+
+// WorkULFM method implementations
+bool ProcessGroupULFM::WorkULFM::has_failures() const {
+  std::lock_guard<std::mutex> lock(failureMutex_);
+  return hasFailures_;
+}
+
+std::vector<int> ProcessGroupULFM::WorkULFM::get_failed_ranks() const {
+  std::lock_guard<std::mutex> lock(failureMutex_);
+  return failedRanks_;
+}
+
+void ProcessGroupULFM::WorkULFM::recordFailure(const std::vector<int>& failedRanks) {
+  std::lock_guard<std::mutex> lock(failureMutex_);
+  hasFailures_ = true;
+  failedRanks_ = failedRanks;
+}
+
 c10::intrusive_ptr<Work> ProcessGroupULFM::broadcast(
     std::vector<at::Tensor>& tensors,
     const BroadcastOptions& opts) {
@@ -548,26 +587,42 @@ c10::intrusive_ptr<Work> ProcessGroupULFM::ulfm_allreduce(
       [opts, ulfm_opts, this](std::unique_ptr<WorkEntry>& entry) {
         auto data = (entry->src)[0];
         c10::DeviceGuard guard(data.device());
-        std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
-        int flag = 1, rc, cls;
-        rc = MPIX_Comm_agree(pgComm_, &flag); 
-        MPI_Error_class(rc, &cls);
-        if (cls == MPIX_ERR_PROC_FAILED || cls == MPIX_ERR_REVOKED) {
-          std::vector<int> failed_in_comm, failed_in_world;
-          get_failed_ranks(pgComm_, rank_, size_, failed_in_comm, &failed_in_world);
-          // MPI_CHECK(MPIX_Comm_agree(pgComm_, &flag));
+        
+        // Get the WorkULFM instance to record failures
+        WorkULFM* ulfm_work = static_cast<WorkULFM*>(entry->ulfmWork);
+        
+        // Use the new modular failure recovery system
+        std::vector<int> failed_ranks;
+        bool recovery_success = detect_and_recover_failures(ulfm_opts.auto_repair, &failed_ranks);
+        
+        // Always record failure for inspection if any were detected
+        if (!failed_ranks.empty() && ulfm_work) {
+          ulfm_work->recordFailure(failed_ranks);
+        }
+        
+        if (!failed_ranks.empty()) {
           if (ulfm_opts.auto_repair) {
-            MPI_Comm new_comm;
-            MPIX_Comm_shrink(pgComm_, &new_comm);
-            MPI_Comm_free(&pgComm_);
-            pgComm_ = new_comm;
-            int curr_rank;
-            MPI_Comm_rank(pgComm_, &curr_rank);
-            fprintf(stderr, "[UFLM Rank %d] New rank is %d\n", rank_, curr_rank);
+            if (!recovery_success) {
+              // Auto-repair failed, throw exception
+              std::string error_msg = "[ULFM Rank " + std::to_string(rank_) + 
+                                      "] Auto-repair failed after detecting failures: ";
+              for (int failed_rank : failed_ranks) {
+                error_msg += std::to_string(failed_rank) + " ";
+              }
+              throw std::runtime_error(error_msg);
+            }
+            // Auto-repair succeeded, continue to allreduce below
+            ULFM_LOG_INFO(rank_, "Auto-repair succeeded, continuing with allreduce");
+          } else {
+            // Don't auto-repair, record failure and bypass allreduce
+            ULFM_LOG_WARN(rank_, "Failures detected, bypassing allreduce (manual recovery needed)");
+            // Skip allreduce - tensor data remains unchanged, which is correct
+            // The work will complete normally but with failure recorded
+            return;
           }
-        };
-        printf("[Rank %d] ULFM All Reduce\n", rank_);
-        ULFM_MPI_CHECK(MPI_Allreduce(
+        }
+        // printf("[Rank %d] ULFM All Reduce\n", rank_);
+        MPI_CHECK(MPI_Allreduce(
             MPI_IN_PLACE,
             data.data_ptr(),
             data.numel(),
@@ -577,9 +632,9 @@ c10::intrusive_ptr<Work> ProcessGroupULFM::ulfm_allreduce(
       };
   auto entry =
       std::make_unique<WorkEntry>(&tensors, &tensors, std::move(runFunc));
-  return enqueue(
+  return enqueueULFM(
       std::move(entry),
-      "mpi:all_reduce",
+      "mpi:ulfm_allreduce",
       std::optional<std::vector<at::Tensor>>(tensors));
 }
 
@@ -1185,6 +1240,267 @@ c10::intrusive_ptr<Work> ProcessGroupULFM::_reduce_scatter_base(
       "mpi:_reduce_scatter_base",
       std::optional<std::vector<at::Tensor>>(inputTensors));
 }
+
+// Comprehensive failure detection and recovery workflow (corrected ULFM protocol order)
+bool ProcessGroupULFM::detect_and_recover_failures(bool auto_repair, std::vector<int>* failed_ranks) {
+  std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
+  
+  try {
+    // Step 1: Notice failure (comm_agree first - detects failures, revokes communicator)
+    if (!this->notice_failure()) {
+      // No failures detected
+      return true;
+    }
+    
+    // Step 2: Get failed ranks (while communicator is revoked)
+    std::vector<int> failed_ranks_comm, failed_ranks_world;
+    if (!this->get_failed_ranks_internal(failed_ranks_comm, &failed_ranks_world)) {
+      ULFM_LOG_ERROR(rank_, "Failed to get failed ranks");
+      return false;
+    }
+    
+    // Return failed ranks to caller if requested
+    if (failed_ranks) {
+      *failed_ranks = failed_ranks_comm;
+    }
+    
+    // Step 3: Ack failures (MUST come before collective operations)
+    if (!this->ack_failures()) {
+      ULFM_LOG_ERROR(rank_, "Failed to ack failures");
+      return false;
+    }
+    
+    // Step 4: Agree on failed ranks (now safe after ack)
+    if (!this->agree_on_failed_ranks(failed_ranks_comm)) {
+      ULFM_LOG_ERROR(rank_, "Failed to agree on failed ranks");
+      return false;
+    }
+    
+    // Step 5: Repair communicator if needed and requested
+    if (this->should_repair_communicator(failed_ranks_comm)) {
+      if (auto_repair) {
+        if (!this->repair_communicator_internal()) {
+          ULFM_LOG_ERROR(rank_, "Failed to repair communicator");
+          return false;
+        }
+        ULFM_LOG_INFO(rank_, "Failure detection and recovery completed successfully");
+      } else {
+        ULFM_LOG_WARN(rank_, "Repair needed but auto_repair disabled");
+      }
+    } else {
+      ULFM_LOG_DEBUG(rank_, "No repair needed");
+    }
+    
+    return true;
+    
+  } catch (...) {
+    ULFM_LOG_ERROR(rank_, "Exception during failure detection and recovery");
+    return false;
+  }
+}
+
+// Step 1: Notice failure (comm_agree first - best practice)
+bool ProcessGroupULFM::notice_failure() {
+  int flag = 1;
+  int rc = MPIX_Comm_agree(pgComm_, &flag);
+  int cls;
+  MPI_Error_class(rc, &cls);
+  
+  // Check if failure was noticed
+  if (cls == MPIX_ERR_PROC_FAILED || cls == MPIX_ERR_REVOKED) {
+    ULFM_LOG_DEBUG(rank_, "Failure noticed via MPIX_Comm_agree");
+    return true; // Failure detected
+  }
+  
+  return false; // No failure
+}
+
+// Step 2: Get failed ranks (modular version of original get_failed_ranks)
+bool ProcessGroupULFM::get_failed_ranks_internal(std::vector<int>& failed_ranks_comm, std::vector<int>* failed_ranks_world) {
+  failed_ranks_comm.clear();
+  if (failed_ranks_world) failed_ranks_world->clear();
+  
+  // Get failed group (after comm_agree has been called)
+  MPI_Group failed_grp = MPI_GROUP_NULL;
+  int rc_get = MPIX_Comm_get_failed(pgComm_, &failed_grp);
+  if (rc_get != MPI_SUCCESS || failed_grp == MPI_GROUP_NULL) {
+    ULFM_LOG_ERROR(rank_, "Failed to get failed group");
+    return false;
+  }
+
+  int fsize = 0;
+  MPI_Group_size(failed_grp, &fsize);
+  if (fsize <= 0) {
+    MPI_Group_free(&failed_grp);
+    ULFM_LOG_ERROR(rank_, "Empty failed group (size=" << fsize << ")");
+    return false;
+  }
+
+  // Build index array 0..fsize-1 in the failed group's own indexing
+  std::vector<int> idx(fsize);
+  for (int i = 0; i < fsize; ++i) idx[i] = i;
+
+  // Translate to ranks in 'comm'
+  MPI_Group comm_grp = MPI_GROUP_NULL;
+  MPI_Comm_group(pgComm_, &comm_grp);
+  failed_ranks_comm.resize(fsize);
+  MPI_Group_translate_ranks(failed_grp, fsize, idx.data(),
+                            comm_grp, failed_ranks_comm.data());
+  MPI_Group_free(&comm_grp);
+
+  if (is_ulfm_verbose_logging() && fsize > 0) {
+    std::ostringstream oss;
+    oss << "Failed ranks in comm: ";
+    for (int i = 0; i < fsize; ++i) {
+      if (i > 0) oss << ", ";
+      oss << failed_ranks_comm[i];
+    }
+    std::string debug_msg = oss.str();
+    if (!debug_msg.empty() && debug_msg != "Failed ranks in comm: ") {
+      ULFM_LOG_DEBUG(rank_, debug_msg);
+    }
+  }
+
+  // Optionally translate to MPI_COMM_WORLD ranks
+  if (failed_ranks_world) {
+    MPI_Group world_grp = MPI_GROUP_NULL;
+    MPI_Comm_group(MPI_COMM_WORLD, &world_grp);
+    failed_ranks_world->resize(fsize);
+    MPI_Group_translate_ranks(failed_grp, fsize, idx.data(),
+                              world_grp, failed_ranks_world->data());
+    MPI_Group_free(&world_grp);
+  }
+
+  MPI_Group_free(&failed_grp);
+  return true;
+}
+
+// Step 3: Agree on failed ranks (collective agreement on failure list)
+bool ProcessGroupULFM::agree_on_failed_ranks(const std::vector<int>& failed_ranks) {
+  // Use a simple agreement protocol - all ranks agree on the number of failures
+  int local_failure_count = static_cast<int>(failed_ranks.size());
+  int agreed_failure_count = local_failure_count;
+  
+  // Use MPIX_Comm_agree to reach consensus on failure count
+  // Note: This may fail if there are still undetected failures
+  int rc = MPIX_Comm_agree(pgComm_, &agreed_failure_count);
+  if (rc != MPI_SUCCESS) {
+    ULFM_LOG_ERROR(rank_, "Failed to agree on failure count");
+    return false;
+  }
+  
+  if (agreed_failure_count != local_failure_count) {
+    ULFM_LOG_ERROR(rank_, "Failure count mismatch: local=" << local_failure_count << ", agreed=" << agreed_failure_count);
+    return false;
+  }
+  
+  ULFM_LOG_DEBUG(rank_, "Successfully agreed on " << agreed_failure_count << " failures");
+  return true;
+}
+
+// Step 4: Check if repair is needed and advisable
+bool ProcessGroupULFM::should_repair_communicator(const std::vector<int>& failed_ranks) {
+  if (failed_ranks.empty()) {
+    return false; // No failures, no repair needed
+  }
+  
+  // Check if we have enough surviving ranks to continue
+  int surviving_ranks = size_ - static_cast<int>(failed_ranks.size());
+  if (surviving_ranks <= 0) {
+    ULFM_LOG_WARN(rank_, "No surviving ranks, cannot repair\n");
+    return false;
+  }
+  
+  // Additional policy checks could go here
+  // For now, repair if we have failures and survivors
+  ULFM_LOG_INFO(rank_, "Repair recommended: " << failed_ranks.size() << " failures, " << surviving_ranks << " survivors");
+  return true;
+}
+
+// Step 3: Ack failures (must be done before collective operations)
+bool ProcessGroupULFM::ack_failures() {
+  // Acknowledge failures to unrevoke the communicator
+  int num_acked;
+  int rc_ack = MPIX_Comm_ack_failed(pgComm_, size_, &num_acked);
+  if (rc_ack != MPI_SUCCESS) {
+    ULFM_LOG_ERROR(rank_, "Failed to ack failures\n");
+    return false;
+  }
+  
+  ULFM_LOG_DEBUG(rank_, "Acknowledged " << num_acked << " failures (communicator unrevoked)");
+  return true;
+}
+
+// Step 5: Repair communicator (shrink operation)
+bool ProcessGroupULFM::repair_communicator_internal() {
+  // Shrink the communicator to remove failed processes
+  MPI_Comm new_comm;
+  int rc_shrink = MPIX_Comm_shrink(pgComm_, &new_comm);
+  if (rc_shrink != MPI_SUCCESS) {
+    ULFM_LOG_WARN(rank_, "Failed to shrink communicator\n");
+    return false;
+  }
+  
+  // Replace old communicator
+  MPI_Comm_free(&pgComm_);
+  pgComm_ = new_comm;
+  
+  // Update current rank and size
+  MPI_Comm_rank(pgComm_, &currentRank_);
+  MPI_Comm_size(pgComm_, &currentSize_);
+  
+  ULFM_LOG_INFO(rank_, "Communicator repaired: original_rank=" << rank_ << ", new_rank=" << currentRank_ << ", new_size=" << currentSize_);
+  
+  return true;
+}
+
+// ProcessGroup-level recovery methods
+bool ProcessGroupULFM::repair_communicator() {
+  std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
+  
+  try {
+    MPI_Comm new_comm;
+    int rc = MPIX_Comm_shrink(pgComm_, &new_comm);
+    if (rc != MPI_SUCCESS) {
+      ULFM_LOG_ERROR(rank_, "Failed to shrink communicator\n");
+      return false;
+    }
+    
+    MPI_Comm_free(&pgComm_);
+    pgComm_ = new_comm;
+    
+    // Update current rank and size after repair (keep original rank_ unchanged)
+    MPI_Comm_rank(pgComm_, &currentRank_);
+    MPI_Comm_size(pgComm_, &currentSize_);
+    
+    ULFM_LOG_INFO(rank_, "Communicator repaired, new rank=" << currentRank_ << ", size=" << currentSize_);
+    return true;
+  } catch (...) {
+    ULFM_LOG_ERROR(rank_, "Exception during communicator repair\n");
+    return false;
+  }
+}
+
+void ProcessGroupULFM::notify_all_ranks_of_failure() {
+  std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
+  
+  // Use MPI_Barrier to synchronize all surviving ranks
+  // This will fail if there are failures, alerting all ranks
+  int flag = 0;  // Signal failure to all ranks
+  MPIX_Comm_agree(pgComm_, &flag);
+}
+
+bool ProcessGroupULFM::check_for_failures() const {
+  std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
+  
+  int flag = 1;
+  int rc = MPIX_Comm_agree(pgComm_, &flag);
+  int cls;
+  MPI_Error_class(rc, &cls);
+  
+  return (cls == MPIX_ERR_PROC_FAILED || cls == MPIX_ERR_REVOKED);
+}
+
 } // namespace c10d
 
 // #endif // USE_C10D_MPI
