@@ -34,6 +34,14 @@ class WorkULFM(Work):
     def get_failed_ranks(self) -> list[int]: 
         """Get list of ranks that failed during this work."""
         ...
+    
+    def was_noop(self) -> bool:
+        """Check if this work was marked as a no-op due to failures."""
+        ...
+    
+    def markNoop(self) -> None:
+        """Mark this work as a no-op (used internally for failure handling)."""
+        ...
 
 class ProcessGroupULFM(ProcessGroup):
     def ulfm_allreduce(
@@ -77,6 +85,19 @@ class ProcessGroupULFM(ProcessGroup):
         Returns:
             Tuple of (success: bool, failed_ranks: list[int])
         """
+        ...
+    
+    # State management methods
+    def set_quiesce(self, v: bool) -> None:
+        """Set the quiesce state of the process group."""
+        ...
+    
+    def is_quiesced(self) -> bool:
+        """Check if the process group is currently quiesced."""
+        ...
+    
+    def worldEpoch(self) -> int:
+        """Get the current world epoch (increments after communicator repairs)."""
         ...
 
 class ULFMCommHook:

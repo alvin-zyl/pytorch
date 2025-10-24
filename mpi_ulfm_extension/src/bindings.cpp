@@ -37,11 +37,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           bool success = self.detect_and_recover_failures(auto_repair, &failed_ranks);
           return py::make_tuple(success, failed_ranks);
       }, py::arg("auto_repair") = true, 
-         "Comprehensive failure detection and recovery workflow. Returns (success, failed_ranks)");
+         "Comprehensive failure detection and recovery workflow. Returns (success, failed_ranks)")
+      .def("set_quiesce", &c10d::ProcessGroupULFM::set_quiesce, py::arg("v"),
+         "Set the quiesce state of the process group")
+      .def("is_quiesced", &c10d::ProcessGroupULFM::is_quiesced,
+         "Check if the process group is currently quiesced")
+      .def("worldEpoch", &c10d::ProcessGroupULFM::worldEpoch,
+         "Get the current world epoch (increments after communicator repairs)");
 
   py::class_<c10d::ProcessGroupULFM::WorkULFM, c10d::Work, c10::intrusive_ptr<c10d::ProcessGroupULFM::WorkULFM>>(m, "WorkULFM")
       .def("has_failures", &c10d::ProcessGroupULFM::WorkULFM::has_failures)
-      .def("get_failed_ranks", &c10d::ProcessGroupULFM::WorkULFM::get_failed_ranks);
+      .def("get_failed_ranks", &c10d::ProcessGroupULFM::WorkULFM::get_failed_ranks)
+      .def("was_noop", &c10d::ProcessGroupULFM::WorkULFM::was_noop,
+         "Check if this work was marked as a no-op due to failures")
+      .def("markNoop", &c10d::ProcessGroupULFM::WorkULFM::markNoop,
+         "Mark this work as a no-op (used internally for failure handling)");
 
   py::class_<c10d::ULFMCommHook>(m, "ULFMCommHook")
       .def(py::init<

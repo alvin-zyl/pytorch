@@ -48,6 +48,9 @@ namespace c10d {
 
 namespace {
 
+// DEPRECATED: This static helper is no longer used. Use ProcessGroupULFM::get_failed_ranks_internal() instead.
+// Kept for backward compatibility but should be removed in future versions.
+// Note: This function still uses ULFM_LOG_ERROR which throws immediately, making return false unreachable.
 static bool get_failed_ranks(MPI_Comm comm,
                              const int& rank,
                              const int& size,
@@ -55,7 +58,7 @@ static bool get_failed_ranks(MPI_Comm comm,
                              std::vector<int>* failed_ranks_world = nullptr) {
   failed_ranks_comm.clear();
   if (failed_ranks_world) failed_ranks_world->clear();
-  
+
   // MPI_Barrier(comm);
   int flag = 1;
   int rc_flag = MPIX_Comm_agree(comm, &flag);
@@ -66,7 +69,7 @@ static bool get_failed_ranks(MPI_Comm comm,
     ULFM_LOG_ERROR(rank, "Failed to ack failures");
     return false;
   }
-  
+
   MPI_Group failed_grp = MPI_GROUP_NULL;
   int rc_get = MPIX_Comm_get_failed(comm, &failed_grp);
   if (rc_get != MPI_SUCCESS || failed_grp == MPI_GROUP_NULL) {
@@ -582,22 +585,39 @@ c10::intrusive_ptr<Work> ProcessGroupULFM::ulfm_allreduce(
     const ULFMOptions& ulfm_opts) {
   
   checkSingleTensor(tensors);
+  const int epoch_at_enqueue = worldEpoch();
 
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
-      [opts, ulfm_opts, this](std::unique_ptr<WorkEntry>& entry) {
+      [opts, ulfm_opts, this, epoch_at_enqueue](std::unique_ptr<WorkEntry>& entry) {
         auto data = (entry->src)[0];
         c10::DeviceGuard guard(data.device());
         
         // Get the WorkULFM instance to record failures
         WorkULFM* ulfm_work = static_cast<WorkULFM*>(entry->ulfmWork);
+
+        // Early NOOP if quiesced
+        if (is_quiesced()) { 
+          if (ulfm_work) ulfm_work->markNoop(); 
+          ULFM_LOG_INFO(rank_, "Quiesced before entering ULFM logic, marked as NOOP");
+          return; 
+        }
         
         // Use the new modular failure recovery system
         std::vector<int> failed_ranks;
-        bool recovery_success = detect_and_recover_failures(ulfm_opts.auto_repair, &failed_ranks);
+        RecoveryResult recovery_success = detect_and_recover_failures(ulfm_opts.auto_repair, &failed_ranks);
         
         // Always record failure for inspection if any were detected
-        if (!failed_ranks.empty() && ulfm_work) {
+        if (recovery_success.has_failure() && ulfm_work) {
           ulfm_work->recordFailure(failed_ranks);
+        }
+        
+        // If quiesced (latch) or epoch changed during detect/repair, NOOP
+        if (is_quiesced() || worldEpoch() != epoch_at_enqueue) {
+          if (ulfm_work) ulfm_work->markNoop();
+          ULFM_LOG_INFO(rank_, "Quiesced: " << (is_quiesced() ? "true" : "false") 
+                                     << " or epoch changed: " << (worldEpoch() != epoch_at_enqueue ? "true" : "false") 
+                                     << " during ULFM logic, marked as NOOP");
+          return;
         }
         
         if (!failed_ranks.empty()) {
@@ -614,6 +634,7 @@ c10::intrusive_ptr<Work> ProcessGroupULFM::ulfm_allreduce(
             // Auto-repair succeeded, continue to allreduce below
             ULFM_LOG_INFO(rank_, "Auto-repair succeeded, continuing with allreduce");
           } else {
+            if (ulfm_work) ulfm_work->markNoop();
             // Don't auto-repair, record failure and bypass allreduce
             ULFM_LOG_WARN(rank_, "Failures detected, bypassing allreduce (manual recovery needed)");
             // Skip allreduce - tensor data remains unchanged, which is correct
@@ -1242,60 +1263,63 @@ c10::intrusive_ptr<Work> ProcessGroupULFM::_reduce_scatter_base(
 }
 
 // Comprehensive failure detection and recovery workflow (corrected ULFM protocol order)
-bool ProcessGroupULFM::detect_and_recover_failures(bool auto_repair, std::vector<int>* failed_ranks) {
+RecoveryResult ProcessGroupULFM::detect_and_recover_failures(bool auto_repair, std::vector<int>* failed_ranks) {
   std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
-  
-  try {
-    // Step 1: Notice failure (comm_agree first - detects failures, revokes communicator)
-    if (!this->notice_failure()) {
-      // No failures detected
-      return true;
-    }
-    
-    // Step 2: Get failed ranks (while communicator is revoked)
-    std::vector<int> failed_ranks_comm, failed_ranks_world;
-    if (!this->get_failed_ranks_internal(failed_ranks_comm, &failed_ranks_world)) {
-      ULFM_LOG_ERROR(rank_, "Failed to get failed ranks");
-      return false;
-    }
-    
-    // Return failed ranks to caller if requested
-    if (failed_ranks) {
-      *failed_ranks = failed_ranks_comm;
-    }
-    
-    // Step 3: Ack failures (MUST come before collective operations)
-    if (!this->ack_failures()) {
-      ULFM_LOG_ERROR(rank_, "Failed to ack failures");
-      return false;
-    }
-    
-    // Step 4: Agree on failed ranks (now safe after ack)
-    if (!this->agree_on_failed_ranks(failed_ranks_comm)) {
-      ULFM_LOG_ERROR(rank_, "Failed to agree on failed ranks");
-      return false;
-    }
-    
-    // Step 5: Repair communicator if needed and requested
-    if (this->should_repair_communicator(failed_ranks_comm)) {
-      if (auto_repair) {
-        if (!this->repair_communicator_internal()) {
-          ULFM_LOG_ERROR(rank_, "Failed to repair communicator");
-          return false;
-        }
-        ULFM_LOG_INFO(rank_, "Failure detection and recovery completed successfully");
-      } else {
-        ULFM_LOG_WARN(rank_, "Repair needed but auto_repair disabled");
+
+  // Step 1: Notice failure (comm_agree first - detects failures, revokes communicator)
+  if (!this->notice_failure()) {
+    // No failures detected
+    return RecoveryResult::NoFailure();
+  }
+
+  // Step 2: Get failed ranks (while communicator is revoked)
+  std::vector<int> failed_ranks_comm, failed_ranks_world;
+  RecoveryResult get_result = this->get_failed_ranks_internal(failed_ranks_comm, &failed_ranks_world);
+  if (!get_result) {
+    ULFM_LOG_ERROR(rank_, get_result.error_message);
+    return get_result;
+  }
+
+  // Return failed ranks to caller if requested
+  if (failed_ranks) {
+    *failed_ranks = failed_ranks_comm;
+  }
+
+  int num_failures = static_cast<int>(failed_ranks_comm.size());
+
+  // Step 3: Ack failures (MUST come before collective operations)
+  RecoveryResult ack_result = this->ack_failures();
+  if (!ack_result) {
+    ULFM_LOG_ERROR(rank_, ack_result.error_message);
+    return ack_result;
+  }
+
+  // Step 4: Agree on failed ranks (now safe after ack)
+  RecoveryResult agree_result = this->agree_on_failed_ranks(failed_ranks_comm);
+  if (!agree_result) {
+    ULFM_LOG_ERROR(rank_, agree_result.error_message);
+    return agree_result;
+  }
+
+  // Step 5: Repair communicator if needed and requested
+  if (this->should_repair_communicator(failed_ranks_comm)) {
+    if (auto_repair) {
+      RecoveryResult repair_result = this->repair_communicator_internal();
+      if (!repair_result) {
+        ULFM_LOG_ERROR(rank_, repair_result.error_message);
+        return repair_result;
       }
+      ULFM_LOG_INFO(rank_, "Failure detection and recovery completed successfully");
+      return RecoveryResult::Recovered(num_failures);
     } else {
-      ULFM_LOG_DEBUG(rank_, "No repair needed");
+      ULFM_LOG_WARN(rank_, "Repair needed but auto_repair disabled");
+      // Failure detected but not repaired (caller's choice)
+      return RecoveryResult::Recovered(num_failures);
     }
-    
-    return true;
-    
-  } catch (...) {
-    ULFM_LOG_ERROR(rank_, "Exception during failure detection and recovery");
-    return false;
+  } else {
+    ULFM_LOG_DEBUG(rank_, "No repair needed");
+    // Failure detected but no repair needed (minor failure or already handled)
+    return RecoveryResult::Recovered(num_failures);
   }
 }
 
@@ -1309,6 +1333,8 @@ bool ProcessGroupULFM::notice_failure() {
   // Check if failure was noticed
   if (cls == MPIX_ERR_PROC_FAILED || cls == MPIX_ERR_REVOKED) {
     ULFM_LOG_DEBUG(rank_, "Failure noticed via MPIX_Comm_agree");
+    MPIX_Comm_revoke(pgComm_); // Ensure communicator is revoked
+    // set_quiesce(true); // latch for the rest of the (failed) step
     return true; // Failure detected
   }
   
@@ -1316,24 +1342,30 @@ bool ProcessGroupULFM::notice_failure() {
 }
 
 // Step 2: Get failed ranks (modular version of original get_failed_ranks)
-bool ProcessGroupULFM::get_failed_ranks_internal(std::vector<int>& failed_ranks_comm, std::vector<int>* failed_ranks_world) {
+RecoveryResult ProcessGroupULFM::get_failed_ranks_internal(std::vector<int>& failed_ranks_comm, std::vector<int>* failed_ranks_world) {
   failed_ranks_comm.clear();
   if (failed_ranks_world) failed_ranks_world->clear();
-  
+
   // Get failed group (after comm_agree has been called)
   MPI_Group failed_grp = MPI_GROUP_NULL;
+
+  // Additional sync point to prevent missing failed ranks
+  int flag = 1;
+  int rc = MPIX_Comm_agree(pgComm_, &flag);
+
+  // After sync point, immediately get failed group (only a practical fix, not tested on scale)
   int rc_get = MPIX_Comm_get_failed(pgComm_, &failed_grp);
   if (rc_get != MPI_SUCCESS || failed_grp == MPI_GROUP_NULL) {
-    ULFM_LOG_ERROR(rank_, "Failed to get failed group");
-    return false;
+    return RecoveryResult::Error("Failed to get failed group", rc_get);
   }
 
   int fsize = 0;
   MPI_Group_size(failed_grp, &fsize);
   if (fsize <= 0) {
     MPI_Group_free(&failed_grp);
-    ULFM_LOG_ERROR(rank_, "Empty failed group (size=" << fsize << ")");
-    return false;
+    std::ostringstream oss;
+    oss << "Empty failed group (size=" << fsize << ")";
+    return RecoveryResult::Error(oss.str());
   }
 
   // Build index array 0..fsize-1 in the failed group's own indexing
@@ -1372,30 +1404,30 @@ bool ProcessGroupULFM::get_failed_ranks_internal(std::vector<int>& failed_ranks_
   }
 
   MPI_Group_free(&failed_grp);
-  return true;
+  return RecoveryResult::NoFailure();
 }
 
 // Step 3: Agree on failed ranks (collective agreement on failure list)
-bool ProcessGroupULFM::agree_on_failed_ranks(const std::vector<int>& failed_ranks) {
+RecoveryResult ProcessGroupULFM::agree_on_failed_ranks(const std::vector<int>& failed_ranks) {
   // Use a simple agreement protocol - all ranks agree on the number of failures
   int local_failure_count = static_cast<int>(failed_ranks.size());
   int agreed_failure_count = local_failure_count;
-  
+
   // Use MPIX_Comm_agree to reach consensus on failure count
   // Note: This may fail if there are still undetected failures
   int rc = MPIX_Comm_agree(pgComm_, &agreed_failure_count);
   if (rc != MPI_SUCCESS) {
-    ULFM_LOG_ERROR(rank_, "Failed to agree on failure count");
-    return false;
+    return RecoveryResult::Error("Failed to agree on failure count", rc);
   }
-  
+
   if (agreed_failure_count != local_failure_count) {
-    ULFM_LOG_ERROR(rank_, "Failure count mismatch: local=" << local_failure_count << ", agreed=" << agreed_failure_count);
-    return false;
+    std::ostringstream oss;
+    oss << "Failure count mismatch: local=" << local_failure_count << ", agreed=" << agreed_failure_count;
+    return RecoveryResult::Error(oss.str());
   }
-  
+
   ULFM_LOG_DEBUG(rank_, "Successfully agreed on " << agreed_failure_count << " failures");
-  return true;
+  return RecoveryResult::NoFailure();
 }
 
 // Step 4: Check if repair is needed and advisable
@@ -1418,66 +1450,70 @@ bool ProcessGroupULFM::should_repair_communicator(const std::vector<int>& failed
 }
 
 // Step 3: Ack failures (must be done before collective operations)
-bool ProcessGroupULFM::ack_failures() {
+RecoveryResult ProcessGroupULFM::ack_failures() {
   // Acknowledge failures to unrevoke the communicator
   int num_acked;
   int rc_ack = MPIX_Comm_ack_failed(pgComm_, size_, &num_acked);
   if (rc_ack != MPI_SUCCESS) {
-    ULFM_LOG_ERROR(rank_, "Failed to ack failures\n");
-    return false;
+    return RecoveryResult::Error("Failed to ack failures", rc_ack);
   }
-  
+
   ULFM_LOG_DEBUG(rank_, "Acknowledged " << num_acked << " failures (communicator unrevoked)");
-  return true;
+  return RecoveryResult::NoFailure();
 }
 
 // Step 5: Repair communicator (shrink operation)
-bool ProcessGroupULFM::repair_communicator_internal() {
+RecoveryResult ProcessGroupULFM::repair_communicator_internal() {
   // Shrink the communicator to remove failed processes
   MPI_Comm new_comm;
   int rc_shrink = MPIX_Comm_shrink(pgComm_, &new_comm);
   if (rc_shrink != MPI_SUCCESS) {
-    ULFM_LOG_WARN(rank_, "Failed to shrink communicator\n");
-    return false;
+    return RecoveryResult::Error("Failed to shrink communicator", rc_shrink);
   }
-  
+
   // Replace old communicator
   MPI_Comm_free(&pgComm_);
   pgComm_ = new_comm;
-  
+
   // Update current rank and size
   MPI_Comm_rank(pgComm_, &currentRank_);
   MPI_Comm_size(pgComm_, &currentSize_);
-  
+
+  int old_epoch_ = worldEpoch();             // Save old epoch for logging
+  bumpEpoch();                               // <<— bump after successful repair
+  int curr_epoch_ = worldEpoch();            // Current epoch after bump
+  ULFM_LOG_INFO(rank_, "Epoch bumped: old_epoch=" << old_epoch_ << ", new_epoch=" << curr_epoch_);
+
   ULFM_LOG_INFO(rank_, "Communicator repaired: original_rank=" << rank_ << ", new_rank=" << currentRank_ << ", new_size=" << currentSize_);
-  
-  return true;
+
+  return RecoveryResult::NoFailure();
 }
 
 // ProcessGroup-level recovery methods
-bool ProcessGroupULFM::repair_communicator() {
+RecoveryResult ProcessGroupULFM::repair_communicator() {
   std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
-  
+
   try {
     MPI_Comm new_comm;
     int rc = MPIX_Comm_shrink(pgComm_, &new_comm);
     if (rc != MPI_SUCCESS) {
-      ULFM_LOG_ERROR(rank_, "Failed to shrink communicator\n");
-      return false;
+      return RecoveryResult::Error("Failed to shrink communicator", rc);
     }
-    
+
     MPI_Comm_free(&pgComm_);
     pgComm_ = new_comm;
-    
+
     // Update current rank and size after repair (keep original rank_ unchanged)
     MPI_Comm_rank(pgComm_, &currentRank_);
     MPI_Comm_size(pgComm_, &currentSize_);
-    
+
     ULFM_LOG_INFO(rank_, "Communicator repaired, new rank=" << currentRank_ << ", size=" << currentSize_);
-    return true;
+    return RecoveryResult::NoFailure();
+  } catch (const std::exception& e) {
+    std::string error_msg = std::string("Exception during communicator repair: ") + e.what();
+    return RecoveryResult::Error(error_msg);
   } catch (...) {
-    ULFM_LOG_ERROR(rank_, "Exception during communicator repair\n");
-    return false;
+    return RecoveryResult::Error("Unknown exception during communicator repair");
   }
 }
 

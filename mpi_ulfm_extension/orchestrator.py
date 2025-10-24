@@ -1,0 +1,536 @@
+import logging
+import threading
+from typing import List, Optional, Set, Tuple, TYPE_CHECKING
+
+import torch
+import torch.distributed as dist
+import ulfm_collectives as ULFM
+
+from policy import GradRestoreMode
+
+if TYPE_CHECKING:  # pragma: no cover - type only
+    from policy import FailureEvent, PolicyDecision, FaultTolerancePolicy
+
+
+logger = logging.getLogger(__name__)
+
+
+class StepTxnOrchestrator:
+    """
+    Process-local coordinator for transactional steps across many process groups.
+
+    This orchestrator owns the policy and provides a unified entry point for all
+    failure handling logic through handle_work_completion().
+
+    Responsibilities:
+      - snapshot gradients before allreduce
+      - track which buckets completed under the current communicator epoch
+      - detect failures in ULFM work completions
+      - consult policy for recovery decisions
+      - apply recovery strategies (quiesce, repair, restore)
+      - drive gradient restoration (blocking or non-blocking)
+
+    Unified Entry Point:
+      - handle_work_completion(work, bucket_index): Call this after each allreduce
+        to handle both success and failure cases. It encapsulates all failure
+        detection, policy consultation, and recovery logic.
+    """
+
+    def __init__(
+        self,
+        rank: int,
+        pg: ULFM.ProcessGroupULFM = None,
+        policy: "FaultTolerancePolicy" = None,
+    ) -> None:
+        self._rank = rank
+        self._pg = pg if pg is not None else dist.group.WORLD
+        self._policy = policy
+
+        # Failure / txn state
+        self._need_restore = threading.Event()
+
+        # Restoration bookkeeping
+        self._restore_streams: dict = {}
+        self._restore_event = None
+        self._restore_plan = GradRestoreMode.SKIP
+        self._restore_started = False
+
+        # Snapshots: (grad_view_ref, snapshot_tensor, pg_epoch_at_snapshot, bucket_idx)
+        self._snapshots: List[Tuple[torch.Tensor, torch.Tensor, int, int]] = []
+
+        # Buckets already reduced in the current epoch
+        self._buckets_reduced_current_epoch: Set[int] = set()
+
+        # Optimizer decision flags
+        self._skip_step_this_iter = False
+
+        # Hook invocation counter (used to detect gradient corruption)
+        self._hook_invocation_counter = 0
+
+        # Training progression (microbatch index / total in accumulation window / macrobatch index)
+        self._current_microbatch_idx = 0
+        self._total_microbatches = 0
+        self._current_macrobatch_idx = 0
+
+    # ------------------------------------------------------------------ #
+    # Policy access
+    # ------------------------------------------------------------------ #
+    @property
+    def policy(self) -> "FaultTolerancePolicy":
+        """Get the fault tolerance policy."""
+        return self._policy
+
+    # ------------------------------------------------------------------ #
+    # Registration and progress
+    # ------------------------------------------------------------------ #
+    def update_progress(
+        self, microbatch_idx: int, total_microbatches: int, macrobatch_idx: int
+    ) -> None:
+        """Called from the training loop to report where we are in the window."""
+        self._current_microbatch_idx = microbatch_idx
+        self._total_microbatches = total_microbatches
+        self._current_macrobatch_idx = macrobatch_idx
+
+    def get_progress(self) -> Tuple[int, int, int]:
+        """Return (current_microbatch_idx, total_microbatches, current_macrobatch_idx)."""
+        return (
+            self._current_microbatch_idx,
+            self._total_microbatches,
+            self._current_macrobatch_idx,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Bucket lifecycle
+    # ------------------------------------------------------------------ #
+
+    def reset_hook_counter(self) -> None:
+        self._hook_invocation_counter = 0
+
+    def get_hook_counter(self) -> int:
+        return self._hook_invocation_counter
+
+    def increment_hook_counter(self) -> None:
+        self._hook_invocation_counter += 1
+
+    def on_bucket_snapshot(
+        self,
+        bucket_buffer: torch.Tensor,
+        bucket_index: int,
+        pg: ULFM.ProcessGroupULFM,
+    ) -> None:
+        """
+        Snapshot the full bucket gradient buffer before reduction.
+        """
+        current_epoch = pg.worldEpoch()
+        snapshot = bucket_buffer.detach().clone()
+        self._snapshots.append((bucket_buffer, snapshot, current_epoch, bucket_index))
+        logger.debug(
+            f"[Rank {self._rank}] Bucket {bucket_index} snapshot captured at pg_epoch {current_epoch}"
+        )
+
+    def on_bucket_reduction_success(
+        self,
+        bucket_index: int,
+    ) -> None:
+        """
+        Mark a bucket as successfully reduced in the current communicator epoch.
+        """
+        self._buckets_reduced_current_epoch.add(bucket_index)
+        logger.debug(
+            f"[Rank {self._rank}] Bucket {bucket_index} successfully reduced"
+        )
+
+    # ------------------------------------------------------------------ #
+    # Failure handling - Unified entry point
+    # ------------------------------------------------------------------ #
+
+    def handle_work_completion(
+        self,
+        work: ULFM.WorkULFM,
+        bucket_index: int,
+    ) -> None:
+        """
+        Unified entry point for handling work completion (success or failure).
+
+        This method encapsulates all the complex logic for:
+        - Detecting failures in ULFM work
+        - Consulting the policy for recovery decisions
+        - Applying orchestrator-side responses (quiesce, restoration planning)
+        - Performing manual or auto-repair of communicators
+        - Tracking successful bucket reductions
+
+        Args:
+            work: ULFM work object from allreduce operation
+            bucket_index: Index of the gradient bucket being processed
+
+        Raises:
+            RuntimeError: If manual communicator repair fails
+            Exception: Re-raises any exception encountered during failure handling
+        """
+        # Import FailureEvent here to avoid circular imports
+        from policy import FailureEvent
+
+        # Check for failures in the work completion
+        if hasattr(work, "has_failures") and work.has_failures():
+            try:
+                failed_ranks = work.get_failed_ranks()
+                hook_count = self.get_hook_counter()
+
+                # Top-level failure detection (always visible)
+                logger.warning(
+                    f"[Rank {self._rank}] Communication failures detected in ranks: {failed_ranks}"
+                )
+
+                # Create FailureEvent for policy
+                current_microbatch_idx, total_microbatches, _ = self.get_progress()
+                if total_microbatches <= 0:
+                    total_microbatches = self._policy.grad_accum_steps if self._policy else 1
+
+                failure_event = FailureEvent(
+                    failed_ranks=failed_ranks,
+                    hook_invocation_count=hook_count,
+                    current_microbatch_idx=current_microbatch_idx,
+                    total_microbatches=total_microbatches,
+                    world_epoch=self._pg.worldEpoch(),
+                )
+
+                # Consult policy for decision
+                decision = self._policy.on_failure(failure_event, self)
+
+                # Detailed policy decision trace (INFO level)
+                logger.info(
+                    f"[Rank {self._rank}] Policy decision: {decision.failure_response.value}, "
+                    f"quiesce={decision.should_quiesce}, manual_repair={decision.should_manual_repair}"
+                )
+
+                # Apply orchestrator-side response (quiesce + restoration plan)
+                self._apply_policy_decision(
+                    decision=decision,
+                    failure_event=failure_event,
+                    failed_ranks=failed_ranks,
+                )
+
+                # Handle communicator repair
+                if decision.should_manual_repair:
+                    # Manual repair (when auto_repair is disabled)
+                    if self._pg.repair_communicator():
+                        logger.info(
+                            f"[Rank {self._rank}] Manual communicator repair successful"
+                        )
+                    else:
+                        logger.error(
+                            f"[Rank {self._rank}] Manual communicator repair failed"
+                        )
+                        raise RuntimeError("Failed to repair communicator")
+                else:
+                    # Auto-repair handles it, just verify
+                    if not self._pg.check_for_failures():
+                        logger.info(
+                            f"[Rank {self._rank}] Auto-repair handled failures successfully"
+                        )
+
+            except Exception as e:
+                logger.error(
+                    f"[Rank {self._rank}] Error handling work completion: {e}"
+                )
+                raise
+            return False
+        else:
+            # No failures - mark bucket as successfully reduced in current epoch
+            self.on_bucket_reduction_success(bucket_index)
+            return True
+
+    def _apply_policy_decision(
+        self,
+        *,
+        decision: "PolicyDecision",
+        failure_event: "FailureEvent",
+        failed_ranks: Optional[List[int]] = None,
+    ) -> None:
+        """
+        Apply policy decision after the ULFM hook observes a failure.
+
+        This is an internal method called by handle_work_completion().
+        """
+        restore_mode = decision.grad_restore_mode or GradRestoreMode.SKIP
+        grads_corrupted = self._hook_invocation_counter > 0
+
+        self._skip_step_this_iter = bool(decision.should_skip_step)
+        self._restore_started = False
+
+        if restore_mode != GradRestoreMode.SKIP and grads_corrupted:
+            self._restore_plan = restore_mode
+            self._need_restore.set()
+        else:
+            self._restore_plan = GradRestoreMode.SKIP
+            self._need_restore.clear()
+
+        # Top-level failure notification (always visible)
+        if decision.should_quiesce:
+            logger.warning(
+                f"[Rank {self._rank}] Failure detected; quiescing PGs "
+                f"(failed_ranks={failed_ranks}, restore_mode={self._restore_plan})"
+            )
+            self._set_quiesce(True)
+        else:
+            logger.warning(
+                f"[Rank {self._rank}] Failure detected; continuing without quiesce "
+                f"(restore_mode={self._restore_plan}, failed_ranks={failed_ranks})"
+            )
+
+        # Detailed failure handling traces (INFO level)
+        if grads_corrupted:
+            if self._restore_plan != GradRestoreMode.SKIP:
+                logger.warning(
+                    f"[Rank {self._rank}] Buckets reduced before failure: {self._hook_invocation_counter}; "
+                    f"marking gradients for restoration"
+                )
+            else:
+                logger.warning(
+                    f"[Rank {self._rank}] Buckets reduced before failure: {self._hook_invocation_counter}; "
+                    f"but not restoring due to policy"
+                )
+        elif not grads_corrupted:
+            logger.info(
+                f"[Rank {self._rank}] Failure occurred before gradient reduction; no restoration needed"
+            )
+
+        # Always reset per-epoch bookkeeping after a failure; the repaired communicator
+        # increments worldEpoch() so we need to re-verify each bucket.
+        self._buckets_reduced_current_epoch.clear()
+
+    # Legacy method for backward compatibility
+    def handle_failure(
+        self,
+        *,
+        decision: "PolicyDecision",
+        failure_event: "FailureEvent",
+        failed_ranks: Optional[List[int]] = None,
+    ) -> None:
+        """
+        Legacy method - use handle_work_completion() instead.
+        Kept for backward compatibility with existing code.
+        """
+        self._apply_policy_decision(
+            decision=decision,
+            failure_event=failure_event,
+            failed_ranks=failed_ranks,
+        )
+
+    def _set_quiesce(self, value: bool) -> None:
+        try:
+            self._pg.set_quiesce(value)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
+    # Restoration control
+    # ------------------------------------------------------------------ #
+
+    def get_restore_plan(self) -> GradRestoreMode:
+        return self._restore_plan
+
+    def should_skip_step(self) -> bool:
+        return self._skip_step_this_iter
+
+    def on_step_skipped(self) -> None:
+        """
+        Called by the training loop when it intentionally skips optimizer.step().
+        Keeps snapshots for the follow-up iteration while reopening communicators.
+        """
+        self._set_quiesce(False)
+        self._skip_step_this_iter = False
+
+    def restore_gradients_non_blocking(self):
+        """
+        Launch non-blocking gradient restoration (used at policy boundaries).
+        """
+        if self._restore_plan != GradRestoreMode.NON_BLOCKING or self._restore_started:
+            return None
+
+        if not self._pg:
+            return None
+        current_epoch = self._pg.worldEpoch()
+
+        snapshots_to_restore = [
+            (view, snap, epoch, bucket_idx)
+            for (view, snap, epoch, bucket_idx) in self._snapshots
+            if epoch < current_epoch
+            and bucket_idx not in self._buckets_reduced_current_epoch
+        ]
+
+        if not snapshots_to_restore:
+            logger.debug(
+                f"[Rank {self._rank}] No snapshots need restoration - all buckets are up to date"
+            )
+            self._need_restore.clear()
+            self._restore_plan = GradRestoreMode.SKIP
+            return None
+
+        use_cuda = torch.cuda.is_available()
+        devices = sorted(
+            {view.device for (view, _, _, _) in snapshots_to_restore},
+            key=lambda d: (d.type, getattr(d, "index", -1)),
+        )
+
+        if use_cuda:
+            for device in devices:
+                if device.type == "cuda" and device not in self._restore_streams:
+                    self._restore_streams[device] = torch.cuda.Stream(device=device)
+
+        restored_count = 0
+        for view, snap, _, _ in snapshots_to_restore:
+            device = view.device
+            if device.type == "cuda" and use_cuda:
+                stream = self._restore_streams[device]
+                with torch.cuda.stream(stream):
+                    view.copy_(
+                        snap.to(dtype=view.dtype, device=device, non_blocking=True),
+                        non_blocking=True,
+                    )
+            else:
+                view.copy_(snap.to(dtype=view.dtype, device=device))
+            restored_count += 1
+
+        self._restore_started = True
+
+        if use_cuda:
+            self._restore_event = torch.cuda.Event()
+            for stream in self._restore_streams.values():
+                self._restore_event.record(stream)
+        else:
+            self._restore_event = None
+
+        logger.info(
+            f"[Rank {self._rank}] Non-blocking restore scheduled - {restored_count} bucket gradients "
+            f"from epoch < {current_epoch}"
+        )
+
+        self._set_quiesce(False)
+        return self._restore_event
+
+    def restore_gradients_blocking(self, re_reduce: bool = True) -> bool:
+        """
+        Blocking gradient restoration before optimizer.step().
+        """
+        if self._restore_plan not in (
+            GradRestoreMode.BLOCKING,
+            GradRestoreMode.NON_BLOCKING,
+        ):
+            return False
+        if not self._need_restore.is_set():
+            return False
+        if not self._pg:
+            return False
+
+        current_epoch = self._pg.worldEpoch()
+
+        snapshots_to_restore = [
+            (view, snap, epoch, bucket_idx)
+            for (view, snap, epoch, bucket_idx) in self._snapshots
+            if epoch < current_epoch
+            and bucket_idx not in self._buckets_reduced_current_epoch
+        ]
+
+        if not snapshots_to_restore:
+            logger.debug(
+                f"[Rank {self._rank}] No snapshots need restoration - all buckets are up to date"
+            )
+            self._need_restore.clear()
+            self._restore_plan = GradRestoreMode.SKIP
+            return False
+
+        if re_reduce:
+            opts = torch.distributed.AllreduceOptions()
+            opts.reduceOp = torch.distributed.ReduceOp.SUM
+            ulfm_opts = ULFM.ULFMOptions()
+            ulfm_opts.auto_repair = self.policy.enable_auto_repair
+
+        restored_count = 0
+        successfully_reduced = set()
+        while snapshots_to_restore:
+            view, snap, epoch, bucket_idx = snapshots_to_restore.pop()
+            view.copy_(snap.to(dtype=view.dtype, device=view.device))
+            restored_count += 1
+            logger.debug(
+                f"[Rank {self._rank}] Restored bucket {bucket_idx} for re-reduction, "
+                f"old_epoch={epoch}, current epoch={current_epoch}, restored_count={restored_count}"
+            )
+
+            if re_reduce:
+                work = self._pg.ulfm_allreduce([view], opts=opts, ulfm_opts=ulfm_opts)
+                work.wait()
+                succeed = self.handle_work_completion(
+                    work=work,
+                    bucket_index=bucket_idx,
+                )
+                if not succeed:
+                    logger.warning(
+                        f"[Rank {self._rank}] Failure during re-reduction of bucket {bucket_idx}"
+                    )
+                    # Use the unified entry point for consistency
+                    snapshots_to_restore = [
+                        (view, snap, epoch, bucket_idx)
+                        for (view, snap, epoch, bucket_idx) in self._snapshots
+                        if epoch < current_epoch
+                        and bucket_idx not in self._buckets_reduced_current_epoch
+                    ]
+                    successfully_reduced.clear()
+                    restored_count = 0
+                    continue
+                else:
+                    successfully_reduced.add(bucket_idx)
+            else:
+                successfully_reduced.add(bucket_idx)
+
+        self._buckets_reduced_current_epoch.update(successfully_reduced)
+        action = "restored and re-reduced" if re_reduce else "restored"
+        logger.info(
+            f"[Rank {self._rank}] Blocking restore completed - {restored_count} bucket gradients {action} "
+            f"from epoch < {current_epoch}"
+        )
+
+        self._set_quiesce(False)
+        self._restore_plan = GradRestoreMode.SKIP
+        self._restore_started = True
+        return True
+
+    def wait_restore_before_backward(self) -> None:
+        """
+        Synchronize non-blocking restoration before starting backward().
+        """
+        if self._restore_event is not None:
+            torch.cuda.current_stream().wait_event(self._restore_event)
+            self._restore_event = None
+        if self._restore_started and self._restore_plan == GradRestoreMode.NON_BLOCKING:
+            self._restore_plan = GradRestoreMode.SKIP
+            self._need_restore.clear()
+            logger.info(
+                f"[Rank {self._rank}] Restore completed (synced before backward)"
+            )
+
+    # ------------------------------------------------------------------ #
+    # Iteration lifecycle
+    # ------------------------------------------------------------------ #
+
+    def mark_iteration_end(self) -> bool:
+        """
+        Called after backward() to determine whether optimizer.step() should run.
+        Returns True if the step was skipped.
+        """
+        skip = self._skip_step_this_iter
+        if not skip:
+            self._snapshots.clear()
+            self._buckets_reduced_current_epoch.clear()
+            self._restore_streams.clear()
+            self._restore_event = None
+            self._restore_plan = GradRestoreMode.SKIP
+            self._restore_started = False
+            self._need_restore.clear()
+            self._set_quiesce(False)
+        self._skip_step_this_iter = False
+        return skip
+
+    def after_successful_commit(self) -> None:
+        """Training loop must call this after a successful optimizer.step()."""
+        self.mark_iteration_end()

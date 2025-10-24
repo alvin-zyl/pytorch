@@ -28,6 +28,57 @@ namespace c10d {
 
 constexpr const char* ULFM_BACKEND_NAME = "mpi";
 
+// Recovery status enum to differentiate between different outcomes
+enum class RecoveryStatus {
+  NO_FAILURE,        // No failure detected, system is healthy
+  RECOVERED,         // Failure(s) detected and successfully recovered
+  FAILED_TO_RECOVER  // Failure(s) detected but recovery failed
+};
+
+// Result type for recovery operations that carries status, error info, and failure details
+struct RecoveryResult {
+  RecoveryStatus status;
+  std::string error_message;
+  int error_code;               // MPI error code if applicable (0 if not applicable)
+  int num_failed_ranks;         // Number of failed ranks detected (0 if no failure)
+
+  // Constructors
+  RecoveryResult()
+      : status(RecoveryStatus::NO_FAILURE), error_code(0), num_failed_ranks(0) {}
+
+  RecoveryResult(RecoveryStatus s, const std::string& msg = "", int code = 0, int failed = 0)
+      : status(s), error_message(msg), error_code(code), num_failed_ranks(failed) {}
+
+  // Factory methods for convenience
+  static RecoveryResult NoFailure() {
+    return RecoveryResult(RecoveryStatus::NO_FAILURE);
+  }
+
+  static RecoveryResult Recovered(int num_failed = 0) {
+    return RecoveryResult(RecoveryStatus::RECOVERED, "", 0, num_failed);
+  }
+
+  static RecoveryResult Error(const std::string& msg, int code = 0) {
+    return RecoveryResult(RecoveryStatus::FAILED_TO_RECOVER, msg, code, 0);
+  }
+
+  // Query methods
+  bool is_ok() const {
+    return status == RecoveryStatus::NO_FAILURE || status == RecoveryStatus::RECOVERED;
+  }
+
+  bool has_failure() const {
+    return status == RecoveryStatus::RECOVERED || status == RecoveryStatus::FAILED_TO_RECOVER;
+  }
+
+  bool failed_to_recover() const {
+    return status == RecoveryStatus::FAILED_TO_RECOVER;
+  }
+
+  // Implicit conversion to bool for backward compatibility (true if ok)
+  operator bool() const { return is_ok(); }
+};
+
 // WorkEntry is the state associated with a single MPI run instance.
 // It include the source Tensor list and destination Tensor list, as well as
 // The actual run function that will operate either on src or dst or both.
@@ -127,6 +178,13 @@ class TORCH_API ProcessGroupULFM : public ProcessGroup {
     // Failure detection methods (no recovery)
     bool has_failures() const;
     std::vector<int> get_failed_ranks() const;
+    bool was_noop() const {
+      return was_noop_.load(std::memory_order_acquire);
+    }
+    void markNoop() {
+      was_noop_.store(true, std::memory_order_release);
+    }
+
 
    protected:
     friend class ProcessGroupULFM;
@@ -136,6 +194,7 @@ class TORCH_API ProcessGroupULFM : public ProcessGroup {
     mutable std::mutex failureMutex_;
     bool hasFailures_;
     std::vector<int> failedRanks_;
+    std::atomic<bool> was_noop_{false};
   };
 
   class AsyncWork : public Work {
@@ -197,12 +256,25 @@ class TORCH_API ProcessGroupULFM : public ProcessGroup {
     );
 
   // Recovery methods (ProcessGroup-level operations)
-  bool repair_communicator();
+  RecoveryResult repair_communicator();
   void notify_all_ranks_of_failure();
   bool check_for_failures() const;
-  
+
+  void set_quiesce(bool v) {
+    quiesce_.store(v, std::memory_order_release);
+  }
+  bool is_quiesced() const {
+    return quiesce_.load(std::memory_order_acquire);
+  }
+
+  // Epoch (bumps after repair)
+  int worldEpoch() const noexcept {
+    return world_epoch_.load(std::memory_order_acquire);
+  }
+
+
   // Comprehensive failure detection and recovery workflow
-  bool detect_and_recover_failures(bool auto_repair = true, std::vector<int>* failed_ranks = nullptr);
+  RecoveryResult detect_and_recover_failures(bool auto_repair = true, std::vector<int>* failed_ranks = nullptr);
 
   c10::intrusive_ptr<Work> allreduce_coalesced(
       std::vector<at::Tensor>& tensors,
@@ -298,11 +370,14 @@ class TORCH_API ProcessGroupULFM : public ProcessGroup {
 
   // Modular failure recovery helper methods (corrected workflow order)
   bool notice_failure();
-  bool get_failed_ranks_internal(std::vector<int>& failed_ranks_comm, std::vector<int>* failed_ranks_world = nullptr);
-  bool ack_failures();
-  bool agree_on_failed_ranks(const std::vector<int>& failed_ranks);
+  RecoveryResult get_failed_ranks_internal(std::vector<int>& failed_ranks_comm, std::vector<int>* failed_ranks_world = nullptr);
+  RecoveryResult ack_failures();
+  RecoveryResult agree_on_failed_ranks(const std::vector<int>& failed_ranks);
   bool should_repair_communicator(const std::vector<int>& failed_ranks);
-  bool repair_communicator_internal();
+  RecoveryResult repair_communicator_internal();
+  void bumpEpoch() {
+    world_epoch_.fetch_add(1, std::memory_order_acq_rel);
+  }
 
   c10::intrusive_ptr<Work> enqueue(
       std::unique_ptr<WorkEntry> entry,
@@ -335,6 +410,10 @@ class TORCH_API ProcessGroupULFM : public ProcessGroup {
   MPI_Comm pgComm_;
   int currentRank_;  // Current rank after repairs (may change)
   int currentSize_;  // Current size after repairs (may change)
+
+ private:
+  std::atomic<bool> quiesce_{false};
+  std::atomic<int>  world_epoch_{0};
 };
 
 } // namespace c10d
