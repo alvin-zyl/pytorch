@@ -128,7 +128,7 @@ class StepTxnOrchestrator:
             f"[Rank {self._rank}] Bucket {bucket_index} snapshot captured at pg_epoch {current_epoch}"
         )
 
-    def on_bucket_reduction_success(
+    def _on_bucket_reduction_success(
         self,
         bucket_index: int,
     ) -> None:
@@ -139,6 +139,12 @@ class StepTxnOrchestrator:
         logger.debug(
             f"[Rank {self._rank}] Bucket {bucket_index} successfully reduced"
         )
+
+    def _on_recovery_success(self) -> None:
+        """
+        Called after a successful recovery.
+        """
+        self._policy.on_recovery()
 
     # ------------------------------------------------------------------ #
     # Failure handling - Unified entry point
@@ -169,6 +175,15 @@ class StepTxnOrchestrator:
         """
         # Import FailureEvent here to avoid circular imports
         from policy import FailureEvent
+
+        # A work could be marked as NOOP even after comm being repaired
+        if hasattr(work, "was_noop") and work.was_noop():
+            noop_bucket = True
+            logger.warning(
+                f"[Rank {self._rank}] bucket {bucket_index} was marked NOOP, needs re-reduction."
+            )
+        else:
+            noop_bucket = False
 
         # Check for failures in the work completion
         if hasattr(work, "has_failures") and work.has_failures():
@@ -207,7 +222,6 @@ class StepTxnOrchestrator:
                 self._apply_policy_decision(
                     decision=decision,
                     failure_event=failure_event,
-                    failed_ranks=failed_ranks,
                 )
 
                 # Handle communicator repair
@@ -217,6 +231,7 @@ class StepTxnOrchestrator:
                         logger.info(
                             f"[Rank {self._rank}] Manual communicator repair successful"
                         )
+                        self._on_recovery_success()
                     else:
                         logger.error(
                             f"[Rank {self._rank}] Manual communicator repair failed"
@@ -228,6 +243,7 @@ class StepTxnOrchestrator:
                         logger.info(
                             f"[Rank {self._rank}] Auto-repair handled failures successfully"
                         )
+                        self._on_recovery_success()
 
             except Exception as e:
                 logger.error(
@@ -236,16 +252,17 @@ class StepTxnOrchestrator:
                 raise
             return False
         else:
-            # No failures - mark bucket as successfully reduced in current epoch
-            self.on_bucket_reduction_success(bucket_index)
-            return True
+            if not noop_bucket:
+                # No failures - mark bucket as successfully reduced in current epoch
+                self._on_bucket_reduction_success(bucket_index)
+                return True
+            return False
 
     def _apply_policy_decision(
         self,
         *,
         decision: "PolicyDecision",
         failure_event: "FailureEvent",
-        failed_ranks: Optional[List[int]] = None,
     ) -> None:
         """
         Apply policy decision after the ULFM hook observes a failure.
@@ -269,13 +286,13 @@ class StepTxnOrchestrator:
         if decision.should_quiesce:
             logger.warning(
                 f"[Rank {self._rank}] Failure detected; quiescing PGs "
-                f"(failed_ranks={failed_ranks}, restore_mode={self._restore_plan})"
+                f"(failed_ranks={failure_event.failed_ranks}, restore_mode={self._restore_plan})"
             )
             self._set_quiesce(True)
         else:
             logger.warning(
                 f"[Rank {self._rank}] Failure detected; continuing without quiesce "
-                f"(restore_mode={self._restore_plan}, failed_ranks={failed_ranks})"
+                f"(restore_mode={self._restore_plan}, failed_ranks={failure_event.failed_ranks})"
             )
 
         # Detailed failure handling traces (INFO level)
@@ -314,7 +331,6 @@ class StepTxnOrchestrator:
         self._apply_policy_decision(
             decision=decision,
             failure_event=failure_event,
-            failed_ranks=failed_ranks,
         )
 
     def _set_quiesce(self, value: bool) -> None:
@@ -409,20 +425,10 @@ class StepTxnOrchestrator:
         self._set_quiesce(False)
         return self._restore_event
 
-    def restore_gradients_blocking(self, re_reduce: bool = True) -> bool:
+    def restore_gradients_blocking(self, re_reduce: bool = True) -> None:
         """
         Blocking gradient restoration before optimizer.step().
         """
-        if self._restore_plan not in (
-            GradRestoreMode.BLOCKING,
-            GradRestoreMode.NON_BLOCKING,
-        ):
-            return False
-        if not self._need_restore.is_set():
-            return False
-        if not self._pg:
-            return False
-
         current_epoch = self._pg.worldEpoch()
 
         snapshots_to_restore = [
@@ -438,7 +444,7 @@ class StepTxnOrchestrator:
             )
             self._need_restore.clear()
             self._restore_plan = GradRestoreMode.SKIP
-            return False
+            return
 
         if re_reduce:
             opts = torch.distributed.AllreduceOptions()
@@ -493,7 +499,7 @@ class StepTxnOrchestrator:
         self._set_quiesce(False)
         self._restore_plan = GradRestoreMode.SKIP
         self._restore_started = True
-        return True
+        return
 
     def wait_restore_before_backward(self) -> None:
         """

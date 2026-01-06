@@ -64,7 +64,19 @@ class PolicyDecision:
 
     # State tracking
     at_iteration_boundary: bool  # Are we at the start/end of accumulation window
+    # DEPRECATED: keep it here for backward compatiblity
     hook_invocation_count: int  # How many buckets reduced before failure
+
+
+@dataclass
+class PolicyState:
+    """Current status of the policy for per-step/window instructions."""
+
+    at_iteration_boundary: bool  # Is current step at a step boundary?
+    failures_this_window: int  # Failures encountered in current accumulation window
+    total_failures: int  # Total failures encountered so far
+    total_recoveries: int  # Total successful recoveries so far
+    curr_grad_accum_steps: int  # Current gradient accumulation window size
 
 
 @dataclass
@@ -99,6 +111,7 @@ class FaultTolerancePolicy:
         # State tracking
         self._current_microbatch = 0
         self._failures_this_window = 0
+        self._recoveries_this_window = 0
         self._total_failures = 0
         self._total_recoveries = 0
 
@@ -124,7 +137,14 @@ class FaultTolerancePolicy:
         """
         raise NotImplementedError("Subclasses must implement on_failure()")
 
-    def on_microbatch_complete(self, microbatch_idx: int) -> PolicyDecision:
+    def on_recovery(self) -> None:
+        """
+        Called after a successful recovery.
+        """
+        self._recoveries_this_window += 1
+        self._total_recoveries += 1
+
+    def on_microbatch_complete(self, microbatch_idx: int) -> PolicyState:
         """
         Called after each microbatch completes successfully.
 
@@ -138,16 +158,12 @@ class FaultTolerancePolicy:
 
         at_boundary = (microbatch_idx + 1) >= self.grad_accum_steps
 
-        return PolicyDecision(
-            failure_response=FailureResponse.REPAIR_AND_CONTINUE,
-            should_quiesce=False,
-            should_manual_repair=False,
-            grad_restore_mode=GradRestoreMode.SKIP,
-            should_skip_step=not at_boundary,
-            grad_accum_steps=self.grad_accum_steps,
-            need_extra_microbatch=False,
+        return PolicyState(
             at_iteration_boundary=at_boundary,
-            hook_invocation_count=0,  # No failure
+            failures_this_window=self._failures_this_window,
+            total_failures=self._total_failures,
+            total_recoveries=self._total_recoveries,
+            curr_grad_accum_steps=self.grad_accum_steps,
         )
 
     def should_restore_gradients(
@@ -207,14 +223,13 @@ class AdaptiveWorldSizePolicy(FaultTolerancePolicy):
         self._total_failures += 1
         self._failures_this_window += 1
 
-        hook_count = failure_event.hook_invocation_count
+        hook_count = failure_event.hook_invocation_count  # DEPRECATED: fragile counter
         num_failed = len(failure_event.failed_ranks)
 
         # Policy decision logging (INFO level - detailed trace)
         logger.info(
             f"[AdaptiveWorldSize] Failure detected: {num_failed} processes failed, "
-            f"hook_count={hook_count}, repairing and continuing, "
-            f"gradient restoration needed: {hook_count > 0}"
+            f"gradient restoration mode is blocking."
         )
 
         # Always just repair and continue - no quiesce, no restoration
@@ -222,17 +237,14 @@ class AdaptiveWorldSizePolicy(FaultTolerancePolicy):
             failure_response=FailureResponse.REPAIR_AND_CONTINUE,
             should_quiesce=False,
             should_manual_repair=not self.enable_auto_repair,
-            grad_restore_mode=(
-                GradRestoreMode.BLOCKING if hook_count > 0 else GradRestoreMode.SKIP
-            ),  # No restoration needed
+            grad_restore_mode=GradRestoreMode.BLOCKING,
             should_skip_step=False,  # Continue with current step
             grad_accum_steps=self.grad_accum_steps,
-            need_extra_microbatch=False,
+            need_extra_microbatch=False,  # Not used in this policy
             at_iteration_boundary=False,  # Not used in this policy
-            hook_invocation_count=hook_count,
+            hook_invocation_count=hook_count,  # DEPRECATED: to be removed
         )
 
-        self._total_recoveries += 1
         return decision
 
 

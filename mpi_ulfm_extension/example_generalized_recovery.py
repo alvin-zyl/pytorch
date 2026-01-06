@@ -130,7 +130,7 @@ class ULFMTrainingManager:
         self.txn.on_step_skipped()
 
     def _start_restore_gradients_blocking(self):
-        return self.txn.restore_gradients_blocking()
+        self.txn.restore_gradients_blocking()
     
     def _on_step_committed(self):
         self.txn.after_successful_commit()
@@ -205,14 +205,14 @@ class ULFMTrainingManager:
                 scaler.scale(loss).backward()
 
         # === After backward: check with policy if we should commit ===
-        decision = self._on_microbatch_complete(self._micro_in_window)
+        state = self._on_microbatch_complete(self._micro_in_window)
         restore_mode = self._get_restore_mode()
 
         stepped = False
         pending_skip = self._should_skip_step()
 
         # === Decide whether to commit optimizer step ===
-        if decision.at_iteration_boundary:
+        if state.at_iteration_boundary:
             if pending_skip:
                 logger.info(
                     f"[Rank {self.txn._rank}] Skipping optimizer step per recovery plan"
@@ -227,8 +227,8 @@ class ULFMTrainingManager:
                 logger.info(
                     f"[Rank {self.txn._rank}] Not at policy boundary - blocking grad restoration before optimizer"
                 )
-                restored = self._start_restore_gradients_blocking()
-                logger.debug(f"[Rank {self.txn._rank}] Blocking restoration completed: {restored}")
+                self._start_restore_gradients_blocking()
+                logger.debug(f"[Rank {self.txn._rank}] Blocking restoration finished.")
 
             # Optimizer step
             if scaler is None:
