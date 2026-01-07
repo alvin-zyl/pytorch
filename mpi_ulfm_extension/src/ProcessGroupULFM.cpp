@@ -591,6 +591,7 @@ c10::intrusive_ptr<Work> ProcessGroupULFM::ulfm_allreduce(
       [opts, ulfm_opts, this, epoch_at_enqueue](std::unique_ptr<WorkEntry>& entry) {
         auto data = (entry->src)[0];
         c10::DeviceGuard guard(data.device());
+        std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
         
         // Get the WorkULFM instance to record failures
         WorkULFM* ulfm_work = static_cast<WorkULFM*>(entry->ulfmWork);
@@ -1264,7 +1265,6 @@ c10::intrusive_ptr<Work> ProcessGroupULFM::_reduce_scatter_base(
 
 // Comprehensive failure detection and recovery workflow (corrected ULFM protocol order)
 RecoveryResult ProcessGroupULFM::detect_and_recover_failures(bool auto_repair, std::vector<int>* failed_ranks) {
-  std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
 
   // Step 1: Notice failure (comm_agree first - detects failures, revokes communicator)
   if (!this->notice_failure()) {
