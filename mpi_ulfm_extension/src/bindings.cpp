@@ -4,7 +4,6 @@
 
 #include "ProcessGroupULFM.hpp"
 #include "TypesULFM.hpp"
-#include "ULFMReducer.hpp"
 #include "ULFMLogging.hpp"
 
 namespace py = pybind11;
@@ -52,31 +51,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
          "Check if this work was marked as a no-op due to failures")
       .def("markNoop", &c10d::ProcessGroupULFM::WorkULFM::markNoop,
          "Mark this work as a no-op (used internally for failure handling)");
-
-  py::class_<c10d::ULFMCommHook>(m, "ULFMCommHook")
-      .def(py::init<
-          c10::intrusive_ptr<c10d::ProcessGroupULFM>,
-          c10d::ULFMFailureHandlingStrategy>(),
-          py::arg("process_group"),
-          py::arg("failure_strategy") = c10d::ULFMFailureHandlingStrategy::CONTINUE_WITH_SURVIVORS)
-      .def("set_failure_handling_strategy", &c10d::ULFMCommHook::set_failure_handling_strategy,
-          py::arg("strategy"))
-      .def("get_failure_handling_strategy", &c10d::ULFMCommHook::get_failure_handling_strategy)
-      .def("is_communicator_healthy", &c10d::ULFMCommHook::is_communicator_healthy)
-      .def("repair_communicator", &c10d::ULFMCommHook::repair_communicator);
-
-  // Note: Reducer class is already bound by PyTorch
-
-  m.def("create_ulfm_hook", [](
-      c10::intrusive_ptr<c10d::ProcessGroupULFM> process_group,
-      c10d::ULFMFailureHandlingStrategy failure_strategy = c10d::ULFMFailureHandlingStrategy::CONTINUE_WITH_SURVIVORS
-  ) {      
-      return c10d::create_ulfm_hook(process_group, failure_strategy);
-  },
-      py::arg("process_group"),
-      py::arg("failure_strategy") = c10d::ULFMFailureHandlingStrategy::CONTINUE_WITH_SURVIVORS,
-      "Create ULFM communication hook for use with PyTorch DDP",
-      py::return_value_policy::automatic);
 
   // ULFM logging control
   m.def("set_ulfm_verbose_logging", &c10d::set_ulfm_verbose_logging, 
