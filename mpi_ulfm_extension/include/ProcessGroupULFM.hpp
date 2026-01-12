@@ -272,6 +272,14 @@ class TORCH_API ProcessGroupULFM : public ProcessGroup {
     return world_epoch_.load(std::memory_order_acquire);
   }
 
+  // Query current rank and size (may change after repairs)
+  int current_rank() const noexcept {
+    return currentRank_;
+  }
+
+  int current_size() const noexcept {
+    return currentSize_;
+  }
 
   // Comprehensive failure detection and recovery workflow
   RecoveryResult detect_and_recover_failures(bool auto_repair = true, std::vector<int>* failed_ranks = nullptr);
@@ -348,6 +356,9 @@ class TORCH_API ProcessGroupULFM : public ProcessGroup {
 
   c10::intrusive_ptr<Work> barrier(
       const BarrierOptions& opts = BarrierOptions()) override;
+
+  c10::intrusive_ptr<Work> consensus(
+    const ULFMOptions& ulfm_opts = ULFMOptions());
 
   // Creating a new ProcessGroupMPI, will initialize MPI if not initialized
   static c10::intrusive_ptr<ProcessGroup> createProcessGroupULFM(

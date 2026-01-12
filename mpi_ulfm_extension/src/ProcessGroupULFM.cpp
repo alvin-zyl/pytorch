@@ -415,7 +415,8 @@ c10::intrusive_ptr<ProcessGroup> ProcessGroupULFM::createProcessGroupULFM(
 }
 
 ProcessGroupULFM::ProcessGroupULFM(int rank, int size, MPI_Comm pgComm)
-    : ProcessGroup(rank, size), stop_(false), pgComm_(pgComm) {
+    : ProcessGroup(rank, size), stop_(false), pgComm_(pgComm),
+      currentRank_(rank), currentSize_(size) {
   if (pgComm_ == MPI_COMM_NULL) {
     TORCH_CHECK(false, "pgComm_ must not be MPI_COMM_NULL");
   }
@@ -1196,6 +1197,37 @@ c10::intrusive_ptr<Work> ProcessGroupULFM::barrier(const BarrierOptions& opts) {
   return enqueue(std::move(entry), "mpi:barrier", std::nullopt);
 }
 
+c10::intrusive_ptr<Work> ProcessGroupULFM::consensus(const ULFMOptions& ulfm_opts) {
+  const int epoch_at_enqueue = worldEpoch();
+
+  std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
+      [ulfm_opts, this, epoch_at_enqueue](std::unique_ptr<WorkEntry>& entry) {
+        std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
+        
+        // Get the WorkULFM instance to record failures
+        WorkULFM* ulfm_work = static_cast<WorkULFM*>(entry->ulfmWork);
+        // Use the new modular failure recovery system
+        std::vector<int> failed_ranks;
+        RecoveryResult recovery_success = detect_and_recover_failures(
+          ulfm_opts.auto_repair, &failed_ranks
+        );
+        // Always record failure for inspection if any were detected
+        if (recovery_success.has_failure() && ulfm_work) {
+          ulfm_work->recordFailure(failed_ranks);
+          if (ulfm_opts.auto_repair) {
+            ULFM_LOG_INFO(rank_, "Consensus: Auto-repair succeeded during consensus, epoch change from "
+                                      << epoch_at_enqueue << " to " << worldEpoch());
+          } else {
+            ULFM_LOG_WARN(rank_, "Consensus: Failures detected during consensus at epoch "
+                                      << epoch_at_enqueue << ", manual recovery needed");
+          }
+        }
+      };
+  auto entry =
+      std::make_unique<WorkEntry>(nullptr, nullptr, std::move(runFunc));
+  return enqueueULFM(std::move(entry), "mpi:consensus", std::nullopt);
+}
+
 c10::intrusive_ptr<Work> ProcessGroupULFM::_allgather_base(
     at::Tensor& outputTensor,
     at::Tensor& inputTensor,
@@ -1453,7 +1485,7 @@ bool ProcessGroupULFM::should_repair_communicator(const std::vector<int>& failed
 RecoveryResult ProcessGroupULFM::ack_failures() {
   // Acknowledge failures to unrevoke the communicator
   int num_acked;
-  int rc_ack = MPIX_Comm_ack_failed(pgComm_, size_, &num_acked);
+  int rc_ack = MPIX_Comm_ack_failed(pgComm_, currentSize_, &num_acked);
   if (rc_ack != MPI_SUCCESS) {
     return RecoveryResult::Error("Failed to ack failures", rc_ack);
   }

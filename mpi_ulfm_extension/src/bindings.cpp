@@ -13,10 +13,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   py::class_<c10d::ULFMOptions>(m, "ULFMOptions")
       .def(py::init<>())
+      .def(py::init([](bool auto_repair) {
+          c10d::ULFMOptions opts;
+          opts.auto_repair = auto_repair;
+          return opts;
+      }),
+      py::arg("auto_repair") = false)
       .def_readwrite("auto_repair", &c10d::ULFMOptions::auto_repair)
-      .def_readwrite("failure_strategy", &c10d::ULFMOptions::failure_strategy)
-      .def_readwrite("max_retries", &c10d::ULFMOptions::max_retries)
-      .def_readwrite("retry_delay_ms", &c10d::ULFMOptions::retry_delay_ms);
+      .def_readwrite("failure_strategy", &c10d::ULFMOptions::failure_strategy);
 
   py::enum_<c10d::ULFMFailureHandlingStrategy>(m, "ULFMFailureHandlingStrategy")
       .value("CONTINUE_WITH_SURVIVORS", c10d::ULFMFailureHandlingStrategy::CONTINUE_WITH_SURVIVORS)
@@ -35,14 +39,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           std::vector<int> failed_ranks;
           bool success = self.detect_and_recover_failures(auto_repair, &failed_ranks);
           return py::make_tuple(success, failed_ranks);
-      }, py::arg("auto_repair") = true, 
+      }, py::arg("auto_repair") = true,
          "Comprehensive failure detection and recovery workflow. Returns (success, failed_ranks)")
+      .def("consensus", &c10d::ProcessGroupULFM::consensus,
+         py::arg("ulfm_opts") = c10d::ULFMOptions(),
+         "Perform consensus operation for failure detection and recovery")
       .def("set_quiesce", &c10d::ProcessGroupULFM::set_quiesce, py::arg("v"),
          "Set the quiesce state of the process group")
       .def("is_quiesced", &c10d::ProcessGroupULFM::is_quiesced,
          "Check if the process group is currently quiesced")
       .def("worldEpoch", &c10d::ProcessGroupULFM::worldEpoch,
-         "Get the current world epoch (increments after communicator repairs)");
+         "Get the current world epoch (increments after communicator repairs)")
+      .def("current_rank", &c10d::ProcessGroupULFM::current_rank,
+         "Get the current rank (may change after communicator repairs)")
+      .def("current_size", &c10d::ProcessGroupULFM::current_size,
+         "Get the current world size (may change after communicator repairs)");
 
   py::class_<c10d::ProcessGroupULFM::WorkULFM, c10d::Work, c10::intrusive_ptr<c10d::ProcessGroupULFM::WorkULFM>>(m, "WorkULFM")
       .def("has_failures", &c10d::ProcessGroupULFM::WorkULFM::has_failures)
