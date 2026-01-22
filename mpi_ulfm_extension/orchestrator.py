@@ -7,9 +7,14 @@ import torch.distributed as dist
 import ulfm_collectives as ULFM
 
 from policy import GradRestoreMode
+from ulfm_work_types import ULFMWorkType
 
-if TYPE_CHECKING:  # pragma: no cover - type only
-    from policy import FailureEvent, PolicyDecision, FaultTolerancePolicy
+from policy import (
+    FailureEvent,
+    PolicyDecision,
+    FaultTolerancePolicy,
+    StaticWorldPolicy,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -60,9 +65,13 @@ class StepTxnOrchestrator:
 
         # Buckets already reduced in the current epoch
         self._buckets_reduced_current_epoch: Set[int] = set()
+        self._buckets_nooped_current_step: Set[int] = set()
 
         # Optimizer decision flags
         self._skip_step_this_iter = False
+        self._at_policy_boundary = False
+        self._num_policy_boundary_steps_remained = 0
+        self._num_zero_grad_procs = 0
 
         # Hook invocation counter (used to detect gradient corruption)
         self._hook_invocation_counter = 0
@@ -79,6 +88,35 @@ class StepTxnOrchestrator:
     def policy(self) -> "FaultTolerancePolicy":
         """Get the fault tolerance policy."""
         return self._policy
+
+    @property
+    def at_policy_boundary(self) -> bool:
+        """Check if we are at a policy boundary."""
+        return self._at_policy_boundary
+
+    @property
+    def is_last_step_at_policy_boundary(self) -> bool:
+        """Check if we are at the last step at a policy boundary."""
+        return (
+            self._at_policy_boundary
+            and self._num_policy_boundary_steps_remained == 0
+            and not self.should_skip_step()
+        )
+
+    @property
+    def should_zero_grad(self) -> bool:
+        """Check if this rank should zero gradients at the last policy boundary step."""
+        return self._pg.is_minor() and (
+            self.is_last_step_at_policy_boundary or not self.at_policy_boundary
+        )
+
+    @property
+    def effective_batch_size(self) -> int:
+        """Get the effective batch size considering grad accumulation and FT policy."""
+        if isinstance(self._policy, StaticWorldPolicy):
+            return self._policy.target_batch_size
+        else:
+            return self._pg.current_size() * self._policy.grad_accum_steps
 
     # ------------------------------------------------------------------ #
     # Registration and progress
@@ -136,9 +174,7 @@ class StepTxnOrchestrator:
         Mark a bucket as successfully reduced in the current communicator epoch.
         """
         self._buckets_reduced_current_epoch.add(bucket_index)
-        logger.debug(
-            f"[Rank {self._rank}] Bucket {bucket_index} successfully reduced"
-        )
+        logger.debug(f"[Rank {self._rank}] Bucket {bucket_index} successfully reduced")
 
     def _on_recovery_success(self) -> None:
         """
@@ -153,7 +189,8 @@ class StepTxnOrchestrator:
     def handle_work_completion(
         self,
         work: ULFM.WorkULFM,
-        bucket_index: int,
+        bucket_index: Optional[int] = None,
+        work_type: Optional[ULFMWorkType] = ULFMWorkType.GRADIENT_REDUCTION,
     ) -> None:
         """
         Unified entry point for handling work completion (success or failure).
@@ -177,10 +214,15 @@ class StepTxnOrchestrator:
         from policy import FailureEvent
 
         # A work could be marked as NOOP even after comm being repaired
-        if hasattr(work, "was_noop") and work.was_noop():
+        if (
+            hasattr(work, "was_noop")
+            and work.was_noop()
+            and work_type == ULFMWorkType.GRADIENT_REDUCTION
+        ):
             noop_bucket = True
+            self._buckets_nooped_current_step.add(bucket_index)
             logger.warning(
-                f"[Rank {self._rank}] bucket {bucket_index} was marked NOOP, needs re-reduction."
+                f"[Rank {self._rank}] bucket {bucket_index} was marked NOOP."
             )
         else:
             noop_bucket = False
@@ -189,7 +231,6 @@ class StepTxnOrchestrator:
         if hasattr(work, "has_failures") and work.has_failures():
             try:
                 failed_ranks = work.get_failed_ranks()
-                hook_count = self.get_hook_counter()
 
                 # Top-level failure detection (always visible)
                 logger.warning(
@@ -199,14 +240,17 @@ class StepTxnOrchestrator:
                 # Create FailureEvent for policy
                 current_microbatch_idx, total_microbatches, _ = self.get_progress()
                 if total_microbatches <= 0:
-                    total_microbatches = self._policy.grad_accum_steps if self._policy else 1
+                    total_microbatches = (
+                        self._policy.grad_accum_steps if self._policy else 1
+                    )
 
                 failure_event = FailureEvent(
                     failed_ranks=failed_ranks,
-                    hook_invocation_count=hook_count,
                     current_microbatch_idx=current_microbatch_idx,
                     total_microbatches=total_microbatches,
                     world_epoch=self._pg.worldEpoch(),
+                    curr_rank=self._pg.current_rank(),
+                    curr_size=self._pg.current_size(),
                 )
 
                 # Consult policy for decision
@@ -246,15 +290,14 @@ class StepTxnOrchestrator:
                         self._on_recovery_success()
 
             except Exception as e:
-                logger.error(
-                    f"[Rank {self._rank}] Error handling work completion: {e}"
-                )
+                logger.error(f"[Rank {self._rank}] Error handling work completion: {e}")
                 raise
             return False
         else:
             if not noop_bucket:
-                # No failures - mark bucket as successfully reduced in current epoch
-                self._on_bucket_reduction_success(bucket_index)
+                if bucket_index is not None:
+                    # No failures - mark bucket as successfully reduced in current epoch
+                    self._on_bucket_reduction_success(bucket_index)
                 return True
             return False
 
@@ -275,7 +318,14 @@ class StepTxnOrchestrator:
         self._skip_step_this_iter = bool(decision.should_skip_step)
         self._restore_started = False
 
-        if restore_mode != GradRestoreMode.SKIP and grads_corrupted:
+        self._at_policy_boundary = bool(decision.at_policy_boundary)
+        if self._at_policy_boundary:
+            self._num_policy_boundary_steps_remained = (
+                decision.num_policy_boundary_steps
+            )
+            self._num_zero_grad_procs = decision.num_zero_grad_procs
+
+        if restore_mode != GradRestoreMode.SKIP:
             self._restore_plan = restore_mode
             self._need_restore.set()
         else:
@@ -295,7 +345,6 @@ class StepTxnOrchestrator:
                 f"(restore_mode={self._restore_plan}, failed_ranks={failure_event.failed_ranks})"
             )
 
-        # Detailed failure handling traces (INFO level)
         if grads_corrupted:
             if self._restore_plan != GradRestoreMode.SKIP:
                 logger.warning(
@@ -315,23 +364,6 @@ class StepTxnOrchestrator:
         # Always reset per-epoch bookkeeping after a failure; the repaired communicator
         # increments worldEpoch() so we need to re-verify each bucket.
         self._buckets_reduced_current_epoch.clear()
-
-    # Legacy method for backward compatibility
-    def handle_failure(
-        self,
-        *,
-        decision: "PolicyDecision",
-        failure_event: "FailureEvent",
-        failed_ranks: Optional[List[int]] = None,
-    ) -> None:
-        """
-        Legacy method - use handle_work_completion() instead.
-        Kept for backward compatibility with existing code.
-        """
-        self._apply_policy_decision(
-            decision=decision,
-            failure_event=failure_event,
-        )
 
     def _set_quiesce(self, value: bool) -> None:
         try:
@@ -355,24 +387,41 @@ class StepTxnOrchestrator:
         Keeps snapshots for the follow-up iteration while reopening communicators.
         """
         self._set_quiesce(False)
-        self._skip_step_this_iter = False
+        self._num_policy_boundary_steps_remained -= 1
+        if self._num_policy_boundary_steps_remained <= 0:
+            self._skip_step_this_iter = False
+            logger.debug(
+                f"[Rank {self._rank}] Completed all skip steps at policy boundary"
+            )
+        else:
+            logger.debug(
+                f"[Rank {self._rank}] Remaining skip steps at policy boundary: {self._num_policy_boundary_steps_remained}"
+            )
+
+    def on_last_step_at_policy_boundary(self, loss) -> bool:
+        if self.is_last_step_at_policy_boundary:
+            if (
+                self._pg.current_rank()
+                >= self._pg.current_size() - self._num_zero_grad_procs
+            ):
+                logger.warning(
+                    f"[Rank {self._rank}] Zero gradients at the last policy boundary step, "
+                    f"num zero grad procs: {self._num_zero_grad_procs}"
+                )
+                loss = loss * 0.0
+        return loss
 
     def restore_gradients_non_blocking(self):
         """
         Launch non-blocking gradient restoration (used at policy boundaries).
         """
-        if self._restore_plan != GradRestoreMode.NON_BLOCKING or self._restore_started:
-            return None
-
-        if not self._pg:
-            return None
         current_epoch = self._pg.worldEpoch()
 
         snapshots_to_restore = [
             (view, snap, epoch, bucket_idx)
             for (view, snap, epoch, bucket_idx) in self._snapshots
             if epoch < current_epoch
-            and bucket_idx not in self._buckets_reduced_current_epoch
+            and bucket_idx not in self._buckets_nooped_current_step
         ]
 
         if not snapshots_to_restore:
@@ -381,7 +430,7 @@ class StepTxnOrchestrator:
             )
             self._need_restore.clear()
             self._restore_plan = GradRestoreMode.SKIP
-            return None
+            return
 
         use_cuda = torch.cuda.is_available()
         devices = sorted(
@@ -423,7 +472,7 @@ class StepTxnOrchestrator:
         )
 
         self._set_quiesce(False)
-        return self._restore_event
+        return
 
     def restore_gradients_blocking(self, re_reduce: bool = True) -> None:
         """
@@ -524,19 +573,26 @@ class StepTxnOrchestrator:
         Called after backward() to determine whether optimizer.step() should run.
         Returns True if the step was skipped.
         """
-        skip = self._skip_step_this_iter
-        if not skip:
-            self._snapshots.clear()
-            self._buckets_reduced_current_epoch.clear()
-            self._restore_streams.clear()
-            self._restore_event = None
-            self._restore_plan = GradRestoreMode.SKIP
-            self._restore_started = False
-            self._need_restore.clear()
-            self._set_quiesce(False)
+        self._snapshots.clear()
+        self._buckets_reduced_current_epoch.clear()
+        self._buckets_nooped_current_step.clear()
+        self._restore_streams.clear()
+        self._restore_event = None
+        self._restore_plan = GradRestoreMode.SKIP
+        self._restore_started = False
+        self._need_restore.clear()
+        self._set_quiesce(False)
         self._skip_step_this_iter = False
-        return skip
+        self._at_policy_boundary = False
+        self._num_policy_boundary_steps_remained = 0
+        self._num_zero_grad_procs = 0
 
     def after_successful_commit(self) -> None:
         """Training loop must call this after a successful optimizer.step()."""
+        # if self.at_policy_boundary:
+        if self.is_last_step_at_policy_boundary:
+            self._policy.advance_policy()
+            logger.debug(
+                f"[Rank {self._rank}] Advanced policy after last step at policy boundary"
+            )
         self.mark_iteration_end()

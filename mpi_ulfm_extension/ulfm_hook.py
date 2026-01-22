@@ -85,13 +85,11 @@ def create_ulfm_recovery_hook(failure_strategy: str = "continue"):
         orch = hstate.orchestrator
         policy = orch.policy  # Get policy from orchestrator
 
-        # print(f"ULFM Hook invoked on rank {orch.rank}, current hook counter {orch.get_hook_counter()}, current macrobatch idx {orch._current_macrobatch_idx}")
-        # if orch.rank == 1 and orch.get_hook_counter() > 0 and orch._current_macrobatch_idx == 2:
-        #     logger.warning(f"[Rank {orch.rank}] Simulating process failure in mid of grad sync")
-        #     os.kill(os.getpid(), signal.SIGKILL)
-
         # 1) If a previous failure quiesced comms, NOOP this bucket
         if getattr(pg, "is_quiesced", lambda: False)():
+            logger.warning(
+                f"[Rank {orch._rank}] Communicator is quiesced before submitting MPI request."
+            )
             fut = torch.futures.Future()
             fut.set_result(bucket.buffer())
             return fut
@@ -108,22 +106,20 @@ def create_ulfm_recovery_hook(failure_strategy: str = "continue"):
         ulfm_opts = ULFM.ULFMOptions()
         ulfm_opts.auto_repair = policy.enable_auto_repair
         ulfm_opts.failure_strategy = strategy_map[failure_strategy]
-        ulfm_opts.max_retries = 3
-        ulfm_opts.retry_delay_ms = 100
 
         # work = dist.ulfm_all_reduce(bucket.buffer(), async_op=True, ulfm_opts=ulfm_opts)
         work = pg.ulfm_allreduce([bucket.buffer()], opts, ulfm_opts)
 
         def on_done(fut):
-            if (
-                orch._rank == 1
-                and orch.get_hook_counter() > 0
-                and orch._current_macrobatch_idx == 2
-            ):
-                logger.warning(
-                    f"[Rank {orch._rank}] Simulating process failure in mid of grad sync, hook counter {orch.get_hook_counter()}"
-                )
-                os.kill(os.getpid(), signal.SIGKILL)
+            # if (
+            #     orch._rank == 1
+            #     and orch.get_hook_counter() > 0
+            #     and orch._current_macrobatch_idx == 2
+            # ):
+            #     logger.warning(
+            #         f"[Rank {orch._rank}] Simulating process failure in mid of grad sync, hook counter {orch.get_hook_counter()}"
+            #     )
+            #     os.kill(os.getpid(), signal.SIGKILL)
 
             # Use orchestrator's unified entry point for handling work completion
             # This encapsulates all failure detection, policy consultation, and recovery logic
