@@ -9,7 +9,7 @@ This example demonstrates the new generalized failure recovery system:
 4. Integration with PyTorch DDP training loops
 """
 
-import os
+import os, time
 import signal
 import logging
 import argparse
@@ -24,6 +24,7 @@ except ImportError:
         "ULFM collectives extension not found. Please build the extension first."
     )
 from training_manager import ULFMTrainingManager
+from failure_simulator import FailureSimulator, set_failure_simulator
 
 # Logger will be configured based on CLI arguments
 logger = logging.getLogger(__name__)
@@ -33,6 +34,7 @@ def log_rank0(message, level=logging.INFO):
     """Log basic training progress from rank 0 only."""
     if dist.is_initialized() and dist.get_rank() == 0:
         logger.log(level, message)
+
 
 def create_simple_model():
     """Create a simple model for testing."""
@@ -98,14 +100,20 @@ def parse_args():
     parser.add_argument(
         "--num-batches",
         type=int,
-        default=8,
+        default=30,
         help="Number of batches per epoch (default: 50)",
     )
     parser.add_argument(
-        "--target-world-size", type=int, default=4, help="Target world size (default: 4)"
+        "--target-world-size",
+        type=int,
+        default=4,
+        help="Target world size (default: 4)",
     )
     parser.add_argument(
-        "--grad-accum-steps", type=int, default=4, help="Gradient accumulation steps (default: 4)"
+        "--grad-accum-steps",
+        type=int,
+        default=4,
+        help="Gradient accumulation steps (default: 4)",
     )
     parser.add_argument(
         "--simulate-failure",
@@ -135,6 +143,16 @@ def main():
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
+    sim = FailureSimulator(
+        seed=42,
+        desired_failures=1,
+        total_minibatches=30,
+        target_ranks={1, 2}
+    )
+    set_failure_simulator(sim)
+    sim.initialize(rank=dist.get_rank(), world_size=dist.get_world_size())                                                                                                                                                                       
+
+
     # Configure logging with rank info, module name, and verbosity level
     log_level = logging.DEBUG if args.verbose else logging.INFO
 
@@ -156,7 +174,10 @@ def main():
 
     if args.verbose:
         log_rank0(f"CLI arguments: {vars(args)}", logging.DEBUG)
-        log_rank0(f"ULFM verbose logging enabled: {ULFM.is_ulfm_verbose_logging()}", logging.DEBUG)
+        log_rank0(
+            f"ULFM verbose logging enabled: {ULFM.is_ulfm_verbose_logging()}",
+            logging.DEBUG,
+        )
 
     # Set device
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
@@ -175,7 +196,7 @@ def main():
         failure_strategy=args.failure_strategy,
         enable_auto_repair=args.auto_repair,
         policy_type=args.policy,
-        target_world_size=args.target_world_size,
+        # target_world_size=args.target_world_size,
         initial_world_size=world_size,
     )
 
@@ -200,6 +221,7 @@ def main():
         )
         log_rank0(f"Failure simulation: {args.simulate_failure}", logging.DEBUG)
 
+    dist.barrier()
     update_steps = 0
     for epoch in range(1, num_epochs + 1):
         epoch_loss = 0.0
@@ -208,16 +230,14 @@ def main():
         log_rank0(f"Starting epoch {epoch}")
 
         for batch_idx, (data, target) in enumerate(train_data):
-            # Simulate failure for testing (rank 1, epoch 3, batch 20)
-            if args.simulate_failure and rank == 2 and epoch == 1 and batch_idx == 0:
-                logger.warning(f"[Rank {rank}] Simulating process failure")
-                os.kill(os.getpid(), signal.SIGKILL)
+            sim.begin_minibatch(batch_idx)
 
             data, target = data.to(device), target.to(device)
 
-            loss, stepped = training_manager.train_step(
-                batch_idx, data, target, criterion, optimizer
-            )
+            with sim.may_fail_here("pre-forward"):
+                loss, stepped = training_manager.train_step(
+                    batch_idx, data, target, criterion, optimizer
+                )
 
             if loss is not None:
                 epoch_loss += loss
@@ -226,12 +246,17 @@ def main():
 
                 if stepped:
                     update_steps += 1
-                    log_rank0(f"Epoch {epoch}, Batch {batch_idx}, Update step {update_steps}, Loss: {loss:.6f}")
+                    log_rank0(
+                        f"Epoch {epoch}, Batch {batch_idx}, Update step {update_steps}, Loss: {loss:.6f}"
+                    )
 
     # Report final statistics
     stats = training_manager.get_recovery_stats()
     log_rank0("=== Training Completed ===")
     log_rank0(f"Recovery Statistics: {stats}")
+    logger.debug(f"[Rank {rank}] Sleeping briefly to ensure clean exit...")
+    time.sleep(1)
+    logger.debug(f"[Rank {rank}] Exiting now.")
 
 
 if __name__ == "__main__":

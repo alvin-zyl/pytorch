@@ -32,7 +32,8 @@ constexpr const char* ULFM_BACKEND_NAME = "mpi";
 enum class RecoveryStatus {
   NO_FAILURE,        // No failure detected, system is healthy
   RECOVERED,         // Failure(s) detected and successfully recovered
-  FAILED_TO_RECOVER  // Failure(s) detected but recovery failed
+  FAILED_TO_RECOVER, // Failure(s) detected but recovery failed
+  NOT_RECOVERED      // Failure(s) detected but recovery not attempted
 };
 
 // Result type for recovery operations that carries status, error info, and failure details
@@ -62,13 +63,22 @@ struct RecoveryResult {
     return RecoveryResult(RecoveryStatus::FAILED_TO_RECOVER, msg, code, 0);
   }
 
+  static RecoveryResult NotRecovered(int num_failed = 0) {
+    return RecoveryResult(RecoveryStatus::NOT_RECOVERED, "", 0, num_failed);
+  }
+
   // Query methods
   bool is_ok() const {
     return status == RecoveryStatus::NO_FAILURE || status == RecoveryStatus::RECOVERED;
   }
 
   bool has_failure() const {
-    return status == RecoveryStatus::RECOVERED || status == RecoveryStatus::FAILED_TO_RECOVER;
+    return status == RecoveryStatus::RECOVERED || status == RecoveryStatus::FAILED_TO_RECOVER ||
+           status == RecoveryStatus::NOT_RECOVERED;
+  }
+
+  bool recovered() const {
+    return status == RecoveryStatus::RECOVERED;
   }
 
   bool failed_to_recover() const {
@@ -185,16 +195,24 @@ class TORCH_API ProcessGroupULFM : public ProcessGroup {
       was_noop_.store(true, std::memory_order_release);
     }
 
+    // Failure statistics and current counts accessors
+    const FailureStats& get_failure_stats() const { return failureStats_; }
+    const RankTypeCounts& get_current_counts() const { return currentCounts_; }
 
    protected:
     friend class ProcessGroupULFM;
-    void recordFailure(const std::vector<int>& failedRanks);
+    void recordFailure(const std::vector<int>& failedRanks,
+                       const FailureStats& failureStats,
+                       const RankTypeCounts& currentCounts);
 
    private:
     mutable std::mutex failureMutex_;
     bool hasFailures_;
     std::vector<int> failedRanks_;
     std::atomic<bool> was_noop_{false};
+
+    FailureStats failureStats_;
+    RankTypeCounts currentCounts_;
   };
 
   class AsyncWork : public Work {
@@ -281,8 +299,147 @@ class TORCH_API ProcessGroupULFM : public ProcessGroup {
     return currentSize_;
   }
 
+  // Minor rank flag: minor procs may zero their loss at the last few steps
+  // to match exact global batch size configuration
+  void set_minor();
+  void reset_minor();
+  bool is_minor() const {
+    return is_minor_.load(std::memory_order_acquire);
+  }
+
+  // Set the major/minor split boundary: ranks < boundary are major, ranks >= boundary are minor
+  void set_major_minor_split(int boundary);
+
+  // Boundary minor rank flag: boundary minor procs are at the boundary between major and minor
+  void set_boundary_minor();
+  void reset_boundary_minor();
+  bool is_boundary_minor() const {
+    return is_boundary_minor_.load(std::memory_order_acquire);
+  }
+
+  // Set the boundary minor split: ranks < num_boundary_majors are not boundary minor,
+  // ranks >= num_boundary_majors are boundary minor
+  void set_boundary_minor_split(int num_boundary_majors, int64_t workload);
+
+  // Set rank type based on explicit counts
+  // Layout: [major workers | major spares | minor workers | minor spares]
+  // - Ranks 0 to (num_majors - 1): Major workers
+  // - Ranks num_majors to (num_majors + num_major_spares - 1): Major spares
+  // - Ranks (num_majors + num_major_spares) to (num_majors + num_major_spares + num_minors - 1): Minor workers
+  // - Remaining ranks: Minor spares
+  void set_major_minor_split_with_spares(int num_majors, int num_minors, int num_major_spares, int num_minor_spares);
+
+  // Spare rank flag: spare procs are standby workers that can replace failed ranks
+  void set_spare();
+  void reset_spare();
+  bool is_spare() const {
+    return is_spare_.load(std::memory_order_acquire);
+  }
+
+  // Count all rank types via single MPI_Allreduce (reusable helper)
+  // Can be called from consensus, ulfm_allreduce, or independently
+  void count_rank_types(RankTypeCounts& counts);
+
+  // Update rank type counts directly (without MPI communication)
+  void update_rank_type_counts(const RankTypeCounts& counts);
+
+  // Count rank types via MPI_Allreduce and update internal counters
+  RankTypeCounts count_and_update_rank_types();
+
+  // Compute failed counts from before/after survivor counts
+  // Input: old counts (before failure), new counts (after failure)
+  // Output: populates failure_stats
+  void compute_failed_counts(const RankTypeCounts& old_counts,
+                             const RankTypeCounts& new_counts,
+                             FailureStats& failure_stats);
+
+  // Check if at policy boundary based on failure stats and current counts
+  // Returns true if: major failed with no major spares OR minor failed with no minor spares
+  static bool check_at_policy_boundary(const FailureStats& failure_stats,
+                                       const RankTypeCounts& current_counts);
+
+  // Update PG-level policy boundary flag
+  // Once set to true, stays true (sticky) until explicitly reset
+  void update_policy_boundary(bool event_boundary);
+
+  // Get PG-level policy boundary flag
+  bool is_at_policy_boundary() const {
+    return atPolicyBoundary_.load(std::memory_order_acquire);
+  }
+
+  // Reset PG-level policy boundary flag (e.g., after policy change)
+  void reset_policy_boundary() {
+    atPolicyBoundary_.store(false, std::memory_order_release);
+  }
+
+  // Elect spare promotion via collective
+  // Returns true if THIS rank was promoted
+  // Automatically calls reset_spare() on promoted ranks
+  bool elect_promotion(int failed_majors, int failed_minors);
+
+  // Combined helper: track rank types, compute failures, auto-elect, and record
+  // Encapsulates the entire failure handling workflow for reuse
+  void record_and_handling_failure(const std::vector<int>& failed_ranks,
+                      const ULFMOptions& ulfm_opts,
+                      WorkULFM* ulfm_work);
+
+  // Getters for rank type counts
+  int get_num_major_procs() const {
+    return num_major_procs_.load(std::memory_order_acquire);
+  }
+  int get_num_minor_procs() const {
+    return num_minor_procs_.load(std::memory_order_acquire);
+  }
+  int get_num_major_spare_procs() const {
+    return num_major_spare_procs_.load(std::memory_order_acquire);
+  }
+  int get_num_minor_spare_procs() const {
+    return num_minor_spare_procs_.load(std::memory_order_acquire);
+  }
+  int get_num_boundary_minor_procs() const {
+    return num_boundary_minor_procs_.load(std::memory_order_acquire);
+  }
+
+  // Local count of how many times this rank contributed gradients to allreduce.
+  // Call increment_contributed() from the Python control plane when this rank's
+  // gradient was not zeroed before the allreduce.
+  int64_t get_contributed() const {
+    return contributed_.load(std::memory_order_acquire);
+  }
+  void increment_contributed() {
+    contributed_.fetch_add(1, std::memory_order_relaxed);
+  }
+  void reset_contributed() {
+    contributed_.store(0, std::memory_order_release);
+  }
+
+  // Target contribution: a settable/incrementable goal value controlled from
+  // the Python control plane (e.g. expected number of gradient contributions).
+  // set replaces the value; increment adds a positive delta.
+  int64_t get_target_contribution() const {
+    return target_contribution_.load(std::memory_order_acquire);
+  }
+  void set_target_contribution(int64_t major_value, int64_t minor_value = -1) {
+    TORCH_CHECK(major_value > 0, "target_contribution major_value must be positive");
+    int64_t effective_minor = (minor_value <= 0) ? major_value : minor_value;
+    TORCH_CHECK(effective_minor > 0, "target_contribution minor_value must be positive");
+    int64_t value = is_minor() ? effective_minor : major_value;
+    target_contribution_.store(value, std::memory_order_release);
+  }
+  void increment_target_contribution(int64_t delta = 1) {
+    TORCH_CHECK(delta > 0, "target_contribution delta must be positive");
+    target_contribution_.fetch_add(delta, std::memory_order_relaxed);
+  }
+
+  // Returns true if this rank has not yet reached its target contribution,
+  // i.e. contributed_ < target_contribution_.
+  bool should_contribute() const {
+    return contributed_.load(std::memory_order_acquire) <
+           target_contribution_.load(std::memory_order_acquire);
+  }
+
   // Comprehensive failure detection and recovery workflow
-  RecoveryResult detect_and_recover_failures(bool auto_repair = true, std::vector<int>* failed_ranks = nullptr);
+  RecoveryResult detect_and_recover_failures(bool auto_repair = true, std::vector<int>* failed_ranks = nullptr, int max_retries = 5);
 
   c10::intrusive_ptr<Work> allreduce_coalesced(
       std::vector<at::Tensor>& tensors,
@@ -381,9 +538,7 @@ class TORCH_API ProcessGroupULFM : public ProcessGroup {
 
   // Modular failure recovery helper methods (corrected workflow order)
   bool notice_failure();
-  RecoveryResult get_failed_ranks_internal(std::vector<int>& failed_ranks_comm, std::vector<int>* failed_ranks_world = nullptr);
-  RecoveryResult ack_failures();
-  RecoveryResult agree_on_failed_ranks(const std::vector<int>& failed_ranks);
+  RecoveryResult get_failed_ranks_internal(std::vector<int>& failed_ranks_comm, std::vector<int>* failed_ranks_world = nullptr, int max_retries = 5);
   bool should_repair_communicator(const std::vector<int>& failed_ranks);
   RecoveryResult repair_communicator_internal();
   void bumpEpoch() {
@@ -425,6 +580,23 @@ class TORCH_API ProcessGroupULFM : public ProcessGroup {
  private:
   std::atomic<bool> quiesce_{false};
   std::atomic<int>  world_epoch_{0};
+  std::atomic<bool> is_minor_{false};  // Minor rank flag for major/minor split
+  std::atomic<bool> is_spare_{false};  // Spare rank flag for standby workers
+  std::atomic<bool> is_boundary_minor_{false};  // Boundary minor rank flag
+  std::atomic<bool> atPolicyBoundary_{false};  // PG-level policy boundary flag (sticky once set)
+
+  // Results from rank type counting
+  std::atomic<int> num_major_procs_{0};       // !is_minor && !is_spare
+  std::atomic<int> num_minor_procs_{0};       // is_minor && !is_spare
+  std::atomic<int> num_major_spare_procs_{0}; // !is_minor && is_spare
+  std::atomic<int> num_minor_spare_procs_{0}; // is_minor && is_spare
+  std::atomic<int> num_boundary_minor_procs_{0}; // is_boundary_minor
+
+  // Local count of gradient contributions (incremented each time this rank's gradient not being zeroed
+  std::atomic<int64_t> contributed_{0};
+
+  // Target contribution: settable/incrementable goal value controlled from Python
+  std::atomic<int64_t> target_contribution_{0};
 };
 
 } // namespace c10d

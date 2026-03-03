@@ -16,11 +16,6 @@ from dataclasses import dataclass
 from typing import Optional, List
 from enum import Enum
 import logging
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from orchestrator import StepTxnOrchestrator
-
 
 logger = logging.getLogger(__name__)
 
@@ -56,10 +51,6 @@ class PolicyDecision:
 
     # Gradient management
     grad_restore_mode: GradRestoreMode
-    should_skip_step: bool  # Skip optimizer.step() this iteration
-
-    # Gradient accumulation adjustment
-    grad_accum_steps: int  # Current window size (may change after failures)
 
     # State tracking
     at_policy_boundary: (
@@ -68,7 +59,9 @@ class PolicyDecision:
 
     # Optional fields for advanced policies (fixed world)
     num_policy_boundary_steps: Optional[int] = None  # Extra steps needed at boundary
-    num_zero_grad_procs: Optional[int] = None  # Num procs with zero grads at the last boundary step
+    num_nonzero_grad_procs: Optional[int] = (
+        None  # Num procs with zero grads at the last boundary step
+    )
 
 
 @dataclass
@@ -79,7 +72,6 @@ class PolicyState:
     failures_this_window: int  # Failures encountered in current accumulation window
     total_failures: int  # Total failures encountered so far
     total_recoveries: int  # Total successful recoveries so far
-    curr_grad_accum_steps: int  # Current gradient accumulation window size
 
 
 @dataclass
@@ -92,6 +84,20 @@ class FailureEvent:
     world_epoch: int  # ProcessGroup epoch (increments on repair)
     curr_rank: int  # Current rank after repairs
     curr_size: int  # Current world size after repairs
+    failed_major: int  # Number of failed major processes
+    failed_minor: int  # Number of failed minor processes
+    failed_major_spares: int  # Number of failed major spare processes
+    failed_minor_spares: int  # Number of failed minor spare processes
+    failed_boundary_minors: int  # Number of failed boundary minor processes
+    curr_num_major_procs: int  # Current number of major processes
+    curr_num_minor_procs: int  # Current number of minor processes
+    curr_num_major_spares: int  # Current number of major spare processes
+    curr_num_minor_spares: int  # Current number of minor spare processes
+    curr_contributed: int  # Number of gradients globally contributed by procs that are not being zeroed
+    at_policy_boundary: bool = False  # Whether failure occurred at policy boundary
+    curr_num_boundary_minor_procs: Optional[int] = (
+        None  # Current number of boundary minor processes
+    )
 
 
 class FaultTolerancePolicy:
@@ -119,6 +125,11 @@ class FaultTolerancePolicy:
         self._total_failures = 0
         self._total_recoveries = 0
 
+    @property
+    def current_grad_accum_steps(self) -> int:
+        """Get the current gradient accumulation steps."""
+        return self.grad_accum_steps
+
     def on_window_start(self):
         """
         Called at the start of each accumulation window.
@@ -126,9 +137,7 @@ class FaultTolerancePolicy:
         self._current_microbatch = 0
         self._failures_this_window = 0
 
-    def on_failure(
-        self, failure_event: FailureEvent, orchestrator: "StepTxnOrchestrator"
-    ) -> PolicyDecision:
+    def on_failure(self, failure_event: FailureEvent) -> PolicyDecision:
         """
         Decide how to handle a failure event.
 
@@ -160,14 +169,13 @@ class FaultTolerancePolicy:
         """
         self._current_microbatch = microbatch_idx
 
-        at_boundary = (microbatch_idx + 1) >= self.grad_accum_steps
+        at_boundary = (microbatch_idx + 1) >= self.current_grad_accum_steps
 
         return PolicyState(
             at_iteration_boundary=at_boundary,
             failures_this_window=self._failures_this_window,
             total_failures=self._total_failures,
             total_recoveries=self._total_recoveries,
-            curr_grad_accum_steps=self.grad_accum_steps,
         )
 
     def get_stats(self):
@@ -178,13 +186,61 @@ class FaultTolerancePolicy:
             "success_rate": self._total_recoveries / max(1, self._total_failures),
             "current_grad_accum_steps": self.grad_accum_steps,
         }
-    
+
+    def update_policy(self):
+        """
+        Update internal policy state if needed at failure when boundary not crossed.
+        Default implementation does nothing.
+        """
+        pass
+
     def advance_policy(self):
         """
         Advance internal policy state after completing a policy boundary adjustment.
         Default implementation does nothing.
         """
         raise NotImplementedError("Subclasses must implement advance_policy()")
+
+    def get_num_major_procs(self) -> int:
+        """
+        Get the number of major processes as per current policy.
+        Default implementation returns total processes (no minor/major split).
+        """
+        return NotImplementedError("Subclasses must implement get_num_major_procs()")
+
+    def get_num_minor_procs(self) -> int:
+        """
+        Get the number of minor processes as per current policy.
+        Default implementation returns zero (no minor/major split).
+        """
+        return NotImplementedError("Subclasses must implement get_num_minor_procs()")
+
+    def get_num_major_spare_procs(self) -> int:
+        """
+        Get the number of major spare processes as per current policy.
+        Default implementation returns zero (no spares).
+        """
+        return NotImplementedError(
+            "Subclasses must implement get_num_major_spare_procs()"
+        )
+
+    def get_num_minor_spare_procs(self) -> int:
+        """
+        Get the number of minor spare processes as per current policy.
+        Default implementation returns zero (no spares).
+        """
+        return NotImplementedError(
+            "Subclasses must implement get_num_minor_spare_procs()"
+        )
+
+    def get_minor_proc_grad_accum_steps(self) -> int:
+        """
+        Get the gradient accumulation steps for minor processes as per current policy.
+        Default implementation returns zero (no minor/major split).
+        """
+        return NotImplementedError(
+            "Subclasses must implement get_minor_proc_grad_accum_steps()"
+        )
 
 
 class AdaptiveWorldPolicy(FaultTolerancePolicy):
@@ -209,9 +265,7 @@ class AdaptiveWorldPolicy(FaultTolerancePolicy):
     ):
         super().__init__(initial_grad_accum_steps, enable_auto_repair)
 
-    def on_failure(
-        self, failure_event: FailureEvent, orchestrator: "StepTxnOrchestrator"
-    ) -> PolicyDecision:
+    def on_failure(self, failure_event: FailureEvent) -> PolicyDecision:
         """
         Handle failure with simple repair and continue strategy.
 
@@ -234,12 +288,13 @@ class AdaptiveWorldPolicy(FaultTolerancePolicy):
             should_quiesce=False,
             should_manual_repair=not self.enable_auto_repair,
             grad_restore_mode=GradRestoreMode.BLOCKING,
-            should_skip_step=False,  # Continue with current step
-            grad_accum_steps=self.grad_accum_steps,
             at_policy_boundary=False,  # Not used in this policy
         )
 
         return decision
+
+    def get_minor_proc_grad_accum_steps(self):
+        return self.grad_accum_steps
 
 
 class StaticWorldPolicy(FaultTolerancePolicy):
@@ -286,15 +341,20 @@ class StaticWorldPolicy(FaultTolerancePolicy):
             logger.warning(
                 f"[FixedWorldSizePolicy] No target_world_size specified, using initial_world_size={initial_world_size}"
             )
-            assert (
-                self.adaptive_grad_accum is True
-            ), "adaptive_grad_accum must be True if target_world_size is not set"
+            if not self.adaptive_grad_accum:
+                self.adaptive_grad_accum = True
+                logger.warning(
+                    "[FixedWorldSizePolicy] Enabling adaptive_grad_accum since target_world_size equals initial_world_size"
+                )
 
         assert (
             self.target_world_size <= initial_world_size
         ), f"target_world_size ({self.target_world_size}) cannot exceed initial_world_size ({initial_world_size})"
 
         self._initial_grad_accum_steps = initial_grad_accum_steps
+        self._current_grad_accum_steps = (
+            initial_grad_accum_steps  # subject to change at policy boundaries
+        )
         self._current_world_size = (
             initial_world_size  # Will be updated on first failure
         )
@@ -307,9 +367,11 @@ class StaticWorldPolicy(FaultTolerancePolicy):
         """Get the effective target batch size considering grad accumulation."""
         return self.target_world_size * self._initial_grad_accum_steps
 
-    def on_failure(
-        self, failure_event: FailureEvent, orchestrator: "StepTxnOrchestrator"
-    ) -> PolicyDecision:
+    @property
+    def current_grad_accum_steps(self):
+        return self._current_grad_accum_steps
+
+    def on_failure(self, failure_event: FailureEvent) -> PolicyDecision:
         """
         Handle failure with boundary-aware logic.
 
@@ -323,88 +385,123 @@ class StaticWorldPolicy(FaultTolerancePolicy):
         self._current_world_size = failure_event.curr_size
 
         # Check if we're at a boundary condition
-        at_policy_boundary = self._is_at_policy_boundary(failure_event, orchestrator)
+        at_policy_boundary = failure_event.at_policy_boundary
         if at_policy_boundary:
-            num_policy_boundary_steps, num_zero_grad_procs = self._on_policy_boundary(
-                failure_event
+            num_policy_boundary_steps, num_nonzero_grad_procs = (
+                self._on_policy_boundary(failure_event)
             )
             decision = PolicyDecision(
                 failure_response=FailureResponse.REPAIR_AND_CONTINUE,
                 should_quiesce=True,
                 should_manual_repair=not self.enable_auto_repair,
                 grad_restore_mode=GradRestoreMode.NON_BLOCKING,
-                should_skip_step=True if at_policy_boundary else False,
-                grad_accum_steps=self.grad_accum_steps,
                 at_policy_boundary=at_policy_boundary,
                 num_policy_boundary_steps=num_policy_boundary_steps,
-                num_zero_grad_procs=num_zero_grad_procs,
+                num_nonzero_grad_procs=num_nonzero_grad_procs,
             )
-       
+        else:
+            self.update_policy(failure_event)
+            decision = PolicyDecision(
+                failure_response=FailureResponse.REPAIR_AND_CONTINUE,
+                should_quiesce=False,
+                should_manual_repair=not self.enable_auto_repair,
+                grad_restore_mode=GradRestoreMode.BLOCKING,
+                at_policy_boundary=at_policy_boundary,
+            )
+
         return decision
 
-    def _is_at_policy_boundary(
-        self, failure_event: FailureEvent, orchestrator: "StepTxnOrchestrator"
-    ) -> bool:
+    def update_policy(self, failure_event: FailureEvent):
         """
-        Determine if this failure crosses a policy boundary.
-
-        Boundaries can be:
-        - World size falls below min_world_size
-        - Too many failures in current window (> max_failures_per_window)
-        - TODO: Other policy-specific boundaries
+        Update internal policy state if needed at failure when boundary not crossed.
+        Default implementation does nothing.
         """
-        # No spares configured, any failure is boundary
-        if not self._num_major_spares and not self._num_minor_spares:
-            logger.warning(
-                "[StaticWorldPolicy] No spares left, any failure crosses policy boundary."
-            )
-            return True
-
-        return False
+        self._current_world_size = failure_event.curr_size
+        self._num_major_spares = failure_event.curr_num_major_spares
+        self._num_minor_spares = failure_event.curr_num_minor_spares
+        logger.info(
+            f"[StaticWorldPolicy] Updated policy state after non-boundary failure: current world size {self._current_world_size}, "
+            f"number of major spares: {self._num_major_spares}, number of minor spares: {self._num_minor_spares}"
+        )
 
     def _on_policy_boundary(self, failure_event: FailureEvent):
         """
         Handle actions needed when at a policy boundary.
         """
-        target_world_size_with_acc = self.target_world_size * self._initial_grad_accum_steps
+        target_world_size_with_acc = (
+            self.target_world_size * self._initial_grad_accum_steps
+        )
+
         num_policy_boundary_steps = 1
         while (
-            failure_event.curr_size
-            * (self.grad_accum_steps + num_policy_boundary_steps)
-            < target_world_size_with_acc
-        ):
+            failure_event.curr_contributed
+            + failure_event.curr_size * num_policy_boundary_steps
+        ) < target_world_size_with_acc:
             num_policy_boundary_steps += 1
+
+        self._current_grad_accum_steps = (
+            self.grad_accum_steps + num_policy_boundary_steps
+        )
+
         num_zero_grad_procs = (
-            failure_event.curr_size
-            * (self.grad_accum_steps + num_policy_boundary_steps)
+            failure_event.curr_contributed
+            + failure_event.curr_size * num_policy_boundary_steps
             - target_world_size_with_acc
         )
-        return num_policy_boundary_steps, num_zero_grad_procs
-    
+        logger.warning(
+            f"[StaticWorldPolicy] At policy boundary: current world size {failure_event.curr_size}, "
+            f"target batch size {target_world_size_with_acc}, current gradients (global) on hand: {failure_event.curr_contributed}, "
+            f"temporarily adjusting grad_accum_steps by {num_policy_boundary_steps}: "
+            f"{self.grad_accum_steps} -> {self._current_grad_accum_steps}. "
+            f"Number of zero-grad procs at the last boundary step: {num_zero_grad_procs}."
+        )
+        num_nonzero_grad_procs = failure_event.curr_size - num_zero_grad_procs
+        return num_policy_boundary_steps, num_nonzero_grad_procs
+
     def advance_policy(self):
         """
         Advance internal policy state after completing a policy boundary adjustment.
         """
-        target_batch_size = self.target_world_size * self._initial_grad_accum_steps # This is fixed
-        while (
-            self._current_world_size * self.grad_accum_steps
-            < target_batch_size
-        ):
-            self.grad_accum_steps += 1 # Increase grad accum steps to be >= target batch size
-        min_num_major_procs = target_batch_size // self.grad_accum_steps # Mimimum procs for the new grad accum steps
+        target_batch_size = (
+            self.target_world_size * self._initial_grad_accum_steps
+        )  # This is fixed
+        while self._current_world_size * self.grad_accum_steps < target_batch_size:
+            self.grad_accum_steps += (
+                1  # Increase grad accum steps to be >= target batch size
+            )
+        min_num_major_procs = (
+            target_batch_size // self.grad_accum_steps
+        )  # Mimimum procs for the new grad accum steps
         # Adjust minor proc grad accum steps to fill the gap
-        self._minor_proc_grad_accum_steps = target_batch_size - min_num_major_procs * self.grad_accum_steps
-        actual_batch_size = min_num_major_procs * self.grad_accum_steps + self._minor_proc_grad_accum_steps
-        assert actual_batch_size == target_batch_size, \
-            f"Invalid policy advancement, target batch size {target_batch_size} != actual batch size {actual_batch_size} "\
-            f"(num major procs: {min_num_major_procs}, grad_accum: {self.grad_accum_steps}); minor procs grad_accum: {self._minor_proc_grad_accum_steps})"
+        self._minor_proc_grad_accum_steps = (
+            target_batch_size - min_num_major_procs * self.grad_accum_steps
+        )
+        actual_batch_size = (
+            min_num_major_procs * self.grad_accum_steps
+            + self._minor_proc_grad_accum_steps
+        )
+        assert actual_batch_size == target_batch_size, (
+            f"Invalid policy advancement, target batch size {target_batch_size} != actual batch size {actual_batch_size} "
+            f"(num major procs: {min_num_major_procs}, grad_accum: {self.grad_accum_steps}); "
+            + f"minor procs grad_accum: {self._minor_proc_grad_accum_steps})"
+            if self._minor_proc_grad_accum_steps
+            else ""
+        )
+
+        num_minors = 1 if self._minor_proc_grad_accum_steps > 0 else 0
 
         # Infer number of spares if possible
-        if min_num_major_procs + 1 < self._current_world_size:
-            total_num_spares = self._current_world_size - (min_num_major_procs + 1)
+        if min_num_major_procs + num_minors < self._current_world_size:
+            total_num_spares = self._current_world_size - (
+                min_num_major_procs + num_minors
+            )
             _num_major_spares = total_num_spares
             _num_minor_spares = 0
-            while _num_major_spares > 1 and _num_major_spares > int(total_num_spares * 0.8):
+            while (
+                num_minors
+                and _num_major_spares > 1
+                and _num_major_spares > int(total_num_spares * 0.8)
+            ):
                 _num_minor_spares += 1
                 _num_major_spares -= 1
             self._num_major_spares = _num_major_spares
@@ -412,13 +509,58 @@ class StaticWorldPolicy(FaultTolerancePolicy):
         else:
             self._num_major_spares = 0
             self._num_minor_spares = 0
-        
+
         logger.warning(
             f"[StaticWorldPolicy] Advanced policy after boundary adjustment: world size: {self._current_world_size}, "
             f"global batch size: {actual_batch_size}, number of major procs: {min_num_major_procs}, "
-            f"gradient accumlation steps: {self.grad_accum_steps}, gradient accumulation steps for minor procs: {self._minor_proc_grad_accum_steps}, "
-            f"number of major spares: {self._num_major_spares}, number of minor spares: {self._num_minor_spares}"
+            f"gradient accumlation steps: {self.grad_accum_steps}, "
+            + (
+                f"number of minor procs: 1, gradient accumulation steps for minor procs: {self._minor_proc_grad_accum_steps}, "
+                if num_minors else "number of minor procs: 0, "
+            )
+            + f"number of major spares: {self._num_major_spares}, number of minor spares: {self._num_minor_spares}"
         )
+        return (
+            min_num_major_procs,
+            num_minors,
+            self._num_major_spares,
+            self._num_minor_spares,
+        )
+
+    def get_num_major_procs(self) -> int:
+        """
+        Get the number of major processes as per current policy.
+        """
+        target_batch_size = (
+            self.target_world_size * self._initial_grad_accum_steps
+        )  # This is fixed
+        min_num_major_procs = target_batch_size // self.grad_accum_steps
+        return min_num_major_procs
+
+    def get_num_minor_procs(self) -> int:
+        """
+        Get the number of minor processes as per current policy.
+        """
+        return 1 if self._minor_proc_grad_accum_steps > 0 else 0
+
+    def get_num_major_spare_procs(self) -> int:
+        """
+        Get the number of major spare processes as per current policy.
+        """
+        return self._num_major_spares
+
+    def get_num_minor_spare_procs(self) -> int:
+        """
+        Get the number of minor spare processes as per current policy.
+        """
+        return self._num_minor_spares
+
+    def get_minor_proc_grad_accum_steps(self) -> int:
+        """
+        Get the gradient accumulation steps for minor processes as per current policy.
+        """
+        return self._minor_proc_grad_accum_steps
+
 
 # Factory function for easy policy creation
 def create_policy(policy_type: str = "adaptive", **kwargs) -> FaultTolerancePolicy:

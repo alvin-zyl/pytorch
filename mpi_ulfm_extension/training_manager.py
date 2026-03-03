@@ -62,13 +62,27 @@ class ULFMTrainingManager:
             **kwargs,
         )
 
+        if policy_type == "static":
+            ulfm_opts = ULFM.ULFMOptions(
+                auto_repair=True,
+                track_rank_types=True,
+            )
+        else:
+            ulfm_opts = ULFM.ULFMOptions(
+                auto_repair=True,
+                track_rank_types=False,
+            )
+
         # Create orchestrator for gradient management (with policy)
         rank = dist.get_rank()
-        self.txn = StepTxnOrchestrator(rank=rank, pg=self.process_group, policy=policy)
+        ulfm_opts = self._create_ulfm_opts(policy_type)
+        self.txn = StepTxnOrchestrator(
+            rank=rank, pg=self.process_group, policy=policy, ulfm_opts=ulfm_opts
+        )
 
         # Create DDP model with ULFM hook
         self.ddp_model = DistributedDataParallel(model)
-        self._register_ulfm_hook()
+        self._register_ulfm_hook(ulfm_opts=ulfm_opts)
 
         self._micro_in_window = 0  # counts [0..K-1] within an accumulation window
 
@@ -77,10 +91,10 @@ class ULFMTrainingManager:
             f"auto_repair={enable_auto_repair}, strategy={failure_strategy}"
         )
 
-    def _register_ulfm_hook(self):
+    def _register_ulfm_hook(self, ulfm_opts):
         """Register ULFM communication hook with recovery logic."""
         hstate = HookState(pg=self.process_group, orchestrator=self.txn)
-        hook = create_ulfm_recovery_hook(failure_strategy=self.failure_strategy)
+        hook = create_ulfm_recovery_hook(ulfm_opts=ulfm_opts)
         self.ddp_model.register_comm_hook(state=hstate, hook=hook)
         logger.debug(
             f"[Rank {self.txn._rank}] ULFM hook registered with policy type: {type(self.policy).__name__}"
@@ -96,15 +110,24 @@ class ULFMTrainingManager:
 
     @property
     def _is_at_grad_sync_step(self):
-        return (
-            (self._micro_in_window + 1) == self._get_grad_accum_steps()
-            if not self.txn.at_policy_boundary
-            else self.txn.is_last_step_at_policy_boundary
-        )
+        return (self._micro_in_window + 1) == self._get_grad_accum_steps()
+
+    def _create_ulfm_opts(self, policy_type):
+        if policy_type == "static":
+            ulfm_opts = ULFM.ULFMOptions(
+                auto_repair=True,
+                track_rank_types=True,
+            )
+        else:
+            ulfm_opts = ULFM.ULFMOptions(
+                auto_repair=True,
+                track_rank_types=False,
+            )
+        return ulfm_opts
 
     def _get_grad_accum_steps(self):
         """Get current gradient accumulation steps from policy."""
-        return self.txn.policy.grad_accum_steps
+        return self.txn.curr_grad_accum_steps
 
     def _get_grad_div_factor(self):
         """Get target world size adjusted for grad accumulation from policy."""
@@ -112,8 +135,7 @@ class ULFMTrainingManager:
 
     def _notify_window_start(self):
         """Notify policy that a new accumulation window is starting."""
-        self.policy.on_window_start()
-        self.txn.reset_hook_counter()
+        self.txn.on_iteration_start()
 
     def _on_microbatch_complete(self, microbatch_idx):
         """Notify policy that a microbatch completed and get decision."""
@@ -128,20 +150,14 @@ class ULFMTrainingManager:
     def _wait_restore_before_backward(self):
         self.txn.wait_restore_before_backward()
 
-    def _should_skip_step(self):
-        return self.txn.should_skip_step()
-
-    def _on_step_skipped(self):
-        self._micro_in_window += 1
-        self.txn.on_step_skipped()
-
-    # Tentative approach, to be removed
-    def _on_last_step_at_policy_boundary(self, loss):
-        return self.txn.on_last_step_at_policy_boundary(loss)
-    
     def _may_zero_grad(self, loss):
         if self.txn.should_zero_grad:
-            return loss * 0.0
+            logger.info(
+                f"[Rank {self.txn._rank}] Zeroing out gradients on micro batch idx "
+                f"{self._micro_in_window} as per policy."
+            )
+            loss *= 0.0
+        return loss
 
     def _start_restore_gradients_blocking(self):
         self.txn.restore_gradients_blocking()
@@ -149,10 +165,15 @@ class ULFMTrainingManager:
     def _on_step_committed(self):
         self.txn.after_successful_commit()
 
-    def _on_consensus_step(self, work: ULFM.WorkULFM):
-        succeed = self.txn.handle_work_completion(work)
+    def _on_consensus_step(self):
+        succeed = self.txn.on_grad_sync_step_consensus()
         if not succeed:
-            logger.warning(f"[Rank {self.txn._rank}] Consensus step detected failures.")
+            logger.warning(
+                f"[Rank {self.txn._rank}] Failures was detected in consensus step."
+            )
+
+    def _on_grad_sync_step(self):
+        self.txn.on_grad_sync_step_prepare()
 
     def train_step(self, batch_idx, data, target, criterion, optimizer, scaler=None):
         """
@@ -200,11 +221,12 @@ class ULFMTrainingManager:
             self._start_restore_gradients_non_blocking()
 
         # === Backward (use no_sync on non-last microbatches) ===
-        ctx = (
-            self.ddp_model.no_sync()
-            if not self._is_at_grad_sync_step
-            else contextlib.nullcontext()
-        )
+        if self._is_at_grad_sync_step:
+            ctx = contextlib.nullcontext()
+            self._on_grad_sync_step()
+        else:
+            ctx = self.ddp_model.no_sync()
+
         with ctx:
             logger.debug(
                 f"[Rank {self.txn._rank}] Backward pass at microbatch {self._micro_in_window} "
@@ -220,12 +242,9 @@ class ULFMTrainingManager:
                     f"[Rank {self.txn._rank}] Non-blocking restoration completed before backward"
                 )
 
-            loss = self._on_last_step_at_policy_boundary(criterion(output, target))
+            loss = self._may_zero_grad(criterion(output, target))
             if isinstance(ctx, contextlib.nullcontext):
-                ulfm_opts = ULFM.ULFMOptions(auto_repair=True)
-                work = self.process_group.consensus(ulfm_opts)
-                work.wait()  # Ensure consensus before grad sync step
-                self._on_consensus_step(work)
+                self._on_consensus_step()
             if scaler is None:
                 loss.backward()
             else:
@@ -236,19 +255,13 @@ class ULFMTrainingManager:
         restore_mode = self._get_restore_mode()
         stepped = False
 
-        if self._should_skip_step():
-            logger.info(
-                f"[Rank {self.txn._rank}] Skipping optimizer step at minibatch {self._micro_in_window} per recovery plan"
-            )
-            self._on_step_skipped()
-            return float(loss.detach()), stepped
-
         # === Decide whether to commit optimizer step ===
         if state.at_iteration_boundary:
             logger.debug(
-                f"[Rank {self.txn._rank}] Microbatch index: {self._micro_in_window}, grad_acc_step: {self.txn.policy.grad_accum_steps}, "
+                f"[Rank {self.txn._rank}] Microbatch index: {self._micro_in_window}, grad_acc_step: {self._get_grad_accum_steps()}, "
                 f"at iteration boundary"
             )
+            self._on_grad_sync_step()
 
             # If NOT at policy boundary but need restoration: blocking restore before optimizer
             if restore_mode == GradRestoreMode.BLOCKING:

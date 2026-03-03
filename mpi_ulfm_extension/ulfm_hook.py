@@ -38,7 +38,7 @@ class HookState:
     orchestrator: StepTxnOrchestrator
 
 
-def create_ulfm_recovery_hook(failure_strategy: str = "continue"):
+def create_ulfm_recovery_hook(ulfm_opts: ULFM.ULFMOptions = None):
     """
     Create a ULFM communication hook with comprehensive failure recovery logic.
 
@@ -70,20 +70,16 @@ def create_ulfm_recovery_hook(failure_strategy: str = "continue"):
         >>> hstate = HookState(pg=pg, orchestrator=orchestrator)
         >>> ddp_model.register_comm_hook(state=hstate, hook=hook)
     """
-    strategy_map = {
-        "continue": ULFM.ULFMFailureHandlingStrategy.CONTINUE_WITH_SURVIVORS,
-        "restart": ULFM.ULFMFailureHandlingStrategy.RESTART_FAILED_PROCESSES,
-        "abort": ULFM.ULFMFailureHandlingStrategy.ABORT_ON_FAILURE,
-    }
 
-    if failure_strategy not in strategy_map:
-        raise ValueError(f"Invalid failure strategy: {failure_strategy}")
+    """ULFMOptions setup with AllreduceOp SUM for gradient reduction."""
+    opts = torch.distributed.AllreduceOptions()
+    opts.reduceOp = torch.distributed.ReduceOp.SUM
+    ulfm_opts = ulfm_opts if ulfm_opts is not None else ULFM.ULFMOptions()
 
     def hook(hstate: HookState, bucket: dist.GradBucket):
         """ULFM communication hook with comprehensive recovery logic."""
         pg = hstate.pg
         orch = hstate.orchestrator
-        policy = orch.policy  # Get policy from orchestrator
 
         # 1) If a previous failure quiesced comms, NOOP this bucket
         if getattr(pg, "is_quiesced", lambda: False)():
@@ -97,15 +93,6 @@ def create_ulfm_recovery_hook(failure_strategy: str = "continue"):
         # 2) Snapshot the entire bucket buffer (pre-reduce)
         bucket_index = bucket.index()
         orch.on_bucket_snapshot(bucket.buffer(), bucket_index, pg)
-
-        # 3) Normal ULFM allreduce (SUM; scale once at commit)
-        opts = torch.distributed.AllreduceOptions()
-        opts.reduceOp = torch.distributed.ReduceOp.SUM
-
-        # Get ULFM options from policy
-        ulfm_opts = ULFM.ULFMOptions()
-        ulfm_opts.auto_repair = policy.enable_auto_repair
-        ulfm_opts.failure_strategy = strategy_map[failure_strategy]
 
         # work = dist.ulfm_all_reduce(bucket.buffer(), async_op=True, ulfm_opts=ulfm_opts)
         work = pg.ulfm_allreduce([bucket.buffer()], opts, ulfm_opts)

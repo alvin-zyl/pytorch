@@ -46,10 +46,18 @@ class StepTxnOrchestrator:
         rank: int,
         pg: ULFM.ProcessGroupULFM = None,
         policy: "FaultTolerancePolicy" = None,
+        ulfm_opts: ULFM.ULFMOptions = None,
     ) -> None:
         self._rank = rank
         self._pg = pg if pg is not None else dist.group.WORLD
         self._policy = policy
+        if ulfm_opts is None:
+            ulfm_opts = ULFM.ULFMOptions()
+            logger.warning(
+                f"[Rank {self._rank}] No ULFMOptions provided; using defaults: "
+                f"auto_repair={ulfm_opts.auto_repair}, track_rank_types={ulfm_opts.track_rank_types}"
+            )
+        self._ulfm_opts = ulfm_opts
 
         # Failure / txn state
         self._need_restore = threading.Event()
@@ -68,10 +76,7 @@ class StepTxnOrchestrator:
         self._buckets_nooped_current_step: Set[int] = set()
 
         # Optimizer decision flags
-        self._skip_step_this_iter = False
         self._at_policy_boundary = False
-        self._num_policy_boundary_steps_remained = 0
-        self._num_zero_grad_procs = 0
 
         # Hook invocation counter (used to detect gradient corruption)
         self._hook_invocation_counter = 0
@@ -80,14 +85,33 @@ class StepTxnOrchestrator:
         self._current_microbatch_idx = 0
         self._total_microbatches = 0
         self._current_macrobatch_idx = 0
+        self.initialize()
 
     # ------------------------------------------------------------------ #
     # Policy access
     # ------------------------------------------------------------------ #
+    def initialize(self):
+        self.dp_pg.set_target_contribution(self.curr_grad_accum_steps)
+
     @property
     def policy(self) -> "FaultTolerancePolicy":
         """Get the fault tolerance policy."""
         return self._policy
+
+    @property
+    def dp_pg(self) -> ULFM.ProcessGroupULFM:
+        """Get the data parallel process group."""
+        return self._pg
+
+    @property
+    def curr_world_size(self) -> int:
+        """Get the current world size from the process group."""
+        return self.dp_pg.current_size()
+
+    @property
+    def ulfm_opts(self) -> ULFM.ULFMOptions:
+        """Get the ULFM options used by this orchestrator."""
+        return self._ulfm_opts
 
     @property
     def at_policy_boundary(self) -> bool:
@@ -95,28 +119,83 @@ class StepTxnOrchestrator:
         return self._at_policy_boundary
 
     @property
-    def is_last_step_at_policy_boundary(self) -> bool:
-        """Check if we are at the last step at a policy boundary."""
-        return (
-            self._at_policy_boundary
-            and self._num_policy_boundary_steps_remained == 0
-            and not self.should_skip_step()
-        )
+    def curr_grad_accum_steps(self) -> int:
+        """Get the number of grad accumulation steps for major procs."""
+        return self.policy.current_grad_accum_steps
+
+    @property
+    def minor_proc_grad_accum_steps(self) -> int:
+        """Get the number of grad accumulation steps for minor procs."""
+        return self.policy.get_minor_proc_grad_accum_steps()
+
+    @property
+    def is_minor(self) -> bool:
+        """Check if this rank is currently a minor rank."""
+        return self.dp_pg.is_minor()
+
+    @property
+    def is_boundary_minor(self) -> bool:
+        """Check if this rank is currently a boundary minor rank."""
+        return self.dp_pg.is_boundary_minor()
+
+    @property
+    def num_major_procs(self) -> int:
+        """Get the current number of major procs from the process group."""
+        return self.dp_pg.get_num_major_procs()
+
+    @property
+    def num_major_spare_procs(self) -> int:
+        """Get the current number of major spare procs from the process group."""
+        return self.dp_pg.get_num_major_spare_procs()
+
+    @property
+    def num_minor_spare_procs(self) -> int:
+        """Get the current number of minor spare procs from the process group."""
+        return self.dp_pg.get_num_minor_spare_procs()
+
+    @property
+    def num_minor_procs(self) -> int:
+        """Get the current number of minor procs from the process group."""
+        return self.dp_pg.get_num_minor_procs()
 
     @property
     def should_zero_grad(self) -> bool:
         """Check if this rank should zero gradients at the last policy boundary step."""
-        return self._pg.is_minor() and (
-            self.is_last_step_at_policy_boundary or not self.at_policy_boundary
-        )
+        if not self.dp_pg.should_contribute():
+            return True
+        else:
+            self.dp_pg.increment_contributed()
+            return False
 
     @property
     def effective_batch_size(self) -> int:
         """Get the effective batch size considering grad accumulation and FT policy."""
-        if isinstance(self._policy, StaticWorldPolicy):
-            return self._policy.target_batch_size
+        if isinstance(self.policy, StaticWorldPolicy):
+            return self.policy.target_batch_size
         else:
-            return self._pg.current_size() * self._policy.grad_accum_steps
+            return self.curr_world_size * self.curr_grad_accum_steps
+
+    @property
+    def policy_sanity_check_passed(self) -> bool:
+        """Check if the current policy configuration is sane as in process group."""
+        num_major_checked = self.num_major_procs == self.policy.get_num_major_procs()
+        num_minor_checked = self.num_minor_procs == self.policy.get_num_minor_procs()
+        num_major_spares_checked = (
+            self.num_major_spare_procs == self.policy.get_num_major_spare_procs()
+        )
+        num_minor_spares_checked = (
+            self.num_minor_spare_procs == self.policy.get_num_minor_spare_procs()
+        )
+        return (
+            num_major_checked
+            and num_minor_checked
+            and num_major_spares_checked
+            and num_minor_spares_checked
+        )
+
+    def detect_policy_boundary(self, at_boundary: bool) -> None:
+        if at_boundary and not self._at_policy_boundary:
+            self._at_policy_boundary = True
 
     # ------------------------------------------------------------------ #
     # Registration and progress
@@ -241,20 +320,50 @@ class StepTxnOrchestrator:
                 current_microbatch_idx, total_microbatches, _ = self.get_progress()
                 if total_microbatches <= 0:
                     total_microbatches = (
-                        self._policy.grad_accum_steps if self._policy else 1
+                        self.policy.grad_accum_steps if self.policy else 1
                     )
+
+                # Unpack failure stats and current counts from work
+                (
+                    failed_major,
+                    failed_minor,
+                    failed_major_spares,
+                    failed_minor_spares,
+                    failed_boundary_minors,
+                    at_policy_boundary,
+                ) = work.get_failure_stats()
+                (
+                    curr_majors,
+                    curr_minors,
+                    curr_major_spares,
+                    curr_minor_spares,
+                    curr_boundary_minors,
+                    curr_contributed,
+                ) = work.get_current_counts()
 
                 failure_event = FailureEvent(
                     failed_ranks=failed_ranks,
                     current_microbatch_idx=current_microbatch_idx,
                     total_microbatches=total_microbatches,
-                    world_epoch=self._pg.worldEpoch(),
-                    curr_rank=self._pg.current_rank(),
-                    curr_size=self._pg.current_size(),
+                    world_epoch=self.dp_pg.worldEpoch(),
+                    curr_rank=self.dp_pg.current_rank(),
+                    curr_size=self.dp_pg.current_size(),
+                    failed_major=failed_major,
+                    failed_minor=failed_minor,
+                    failed_major_spares=failed_major_spares,
+                    failed_minor_spares=failed_minor_spares,
+                    failed_boundary_minors=failed_boundary_minors,
+                    curr_num_major_procs=curr_majors,
+                    curr_num_minor_procs=curr_minors,
+                    curr_num_major_spares=curr_major_spares,
+                    curr_num_minor_spares=curr_minor_spares,
+                    curr_num_boundary_minor_procs=curr_boundary_minors,
+                    curr_contributed=curr_contributed,
+                    at_policy_boundary=at_policy_boundary,
                 )
 
                 # Consult policy for decision
-                decision = self._policy.on_failure(failure_event, self)
+                decision = self.policy.on_failure(failure_event)
 
                 # Detailed policy decision trace (INFO level)
                 logger.info(
@@ -271,7 +380,7 @@ class StepTxnOrchestrator:
                 # Handle communicator repair
                 if decision.should_manual_repair:
                     # Manual repair (when auto_repair is disabled)
-                    if self._pg.repair_communicator():
+                    if self.dp_pg.repair_communicator():
                         logger.info(
                             f"[Rank {self._rank}] Manual communicator repair successful"
                         )
@@ -283,7 +392,7 @@ class StepTxnOrchestrator:
                         raise RuntimeError("Failed to repair communicator")
                 else:
                     # Auto-repair handles it, just verify
-                    if not self._pg.check_for_failures():
+                    if not self.dp_pg.check_for_failures():
                         logger.info(
                             f"[Rank {self._rank}] Auto-repair handled failures successfully"
                         )
@@ -315,15 +424,14 @@ class StepTxnOrchestrator:
         restore_mode = decision.grad_restore_mode or GradRestoreMode.SKIP
         grads_corrupted = self._hook_invocation_counter > 0
 
-        self._skip_step_this_iter = bool(decision.should_skip_step)
         self._restore_started = False
 
-        self._at_policy_boundary = bool(decision.at_policy_boundary)
-        if self._at_policy_boundary:
-            self._num_policy_boundary_steps_remained = (
-                decision.num_policy_boundary_steps
+        self.detect_policy_boundary(decision.at_policy_boundary)
+        if self.at_policy_boundary:
+            self.dp_pg.set_boundary_minor_split(
+                decision.num_nonzero_grad_procs,
+                decision.num_policy_boundary_steps,
             )
-            self._num_zero_grad_procs = decision.num_zero_grad_procs
 
         if restore_mode != GradRestoreMode.SKIP:
             self._restore_plan = restore_mode
@@ -367,7 +475,7 @@ class StepTxnOrchestrator:
 
     def _set_quiesce(self, value: bool) -> None:
         try:
-            self._pg.set_quiesce(value)
+            self.dp_pg.set_quiesce(value)
         except Exception:
             pass
 
@@ -378,44 +486,11 @@ class StepTxnOrchestrator:
     def get_restore_plan(self) -> GradRestoreMode:
         return self._restore_plan
 
-    def should_skip_step(self) -> bool:
-        return self._skip_step_this_iter
-
-    def on_step_skipped(self) -> None:
-        """
-        Called by the training loop when it intentionally skips optimizer.step().
-        Keeps snapshots for the follow-up iteration while reopening communicators.
-        """
-        self._set_quiesce(False)
-        self._num_policy_boundary_steps_remained -= 1
-        if self._num_policy_boundary_steps_remained <= 0:
-            self._skip_step_this_iter = False
-            logger.debug(
-                f"[Rank {self._rank}] Completed all skip steps at policy boundary"
-            )
-        else:
-            logger.debug(
-                f"[Rank {self._rank}] Remaining skip steps at policy boundary: {self._num_policy_boundary_steps_remained}"
-            )
-
-    def on_last_step_at_policy_boundary(self, loss) -> bool:
-        if self.is_last_step_at_policy_boundary:
-            if (
-                self._pg.current_rank()
-                >= self._pg.current_size() - self._num_zero_grad_procs
-            ):
-                logger.warning(
-                    f"[Rank {self._rank}] Zero gradients at the last policy boundary step, "
-                    f"num zero grad procs: {self._num_zero_grad_procs}"
-                )
-                loss = loss * 0.0
-        return loss
-
     def restore_gradients_non_blocking(self):
         """
         Launch non-blocking gradient restoration (used at policy boundaries).
         """
-        current_epoch = self._pg.worldEpoch()
+        current_epoch = self.dp_pg.worldEpoch()
 
         snapshots_to_restore = [
             (view, snap, epoch, bucket_idx)
@@ -425,7 +500,7 @@ class StepTxnOrchestrator:
         ]
 
         if not snapshots_to_restore:
-            logger.debug(
+            logger.info(
                 f"[Rank {self._rank}] No snapshots need restoration - all buckets are up to date"
             )
             self._need_restore.clear()
@@ -478,7 +553,7 @@ class StepTxnOrchestrator:
         """
         Blocking gradient restoration before optimizer.step().
         """
-        current_epoch = self._pg.worldEpoch()
+        current_epoch = self.dp_pg.worldEpoch()
 
         snapshots_to_restore = [
             (view, snap, epoch, bucket_idx)
@@ -513,7 +588,7 @@ class StepTxnOrchestrator:
             )
 
             if re_reduce:
-                work = self._pg.ulfm_allreduce([view], opts=opts, ulfm_opts=ulfm_opts)
+                work = self.dp_pg.ulfm_allreduce([view], opts=opts, ulfm_opts=ulfm_opts)
                 work.wait()
                 succeed = self.handle_work_completion(
                     work=work,
@@ -564,9 +639,41 @@ class StepTxnOrchestrator:
                 f"[Rank {self._rank}] Restore completed (synced before backward)"
             )
 
+    def on_grad_sync_step_consensus(self) -> bool:
+        consensus_ulfm_opts = self.ulfm_opts.copy()
+        consensus_ulfm_opts.consensus_on_rank_types = False
+        work = self.dp_pg.consensus(consensus_ulfm_opts)
+        work.wait()
+        succeed = self.handle_work_completion(
+            work=work, work_type=ULFMWorkType.CONSENSUS
+        )
+        return succeed
+
     # ------------------------------------------------------------------ #
     # Iteration lifecycle
     # ------------------------------------------------------------------ #
+
+    def on_iteration_start(self) -> None:
+        self.reset_hook_counter()
+        self.policy.on_window_start()
+
+    def on_grad_sync_step_prepare(self) -> None:
+        self._set_quiesce(False)
+
+    def _on_policy_advancement(self) -> None:
+        rank_type_counts = self.policy.advance_policy()
+        self.dp_pg.set_major_minor_split_with_spares(*rank_type_counts)
+        self.dp_pg.update_rank_type_counts(*rank_type_counts)
+        self.dp_pg.reset_policy_boundary()
+        self.dp_pg.set_target_contribution(
+            self.curr_grad_accum_steps, self.minor_proc_grad_accum_steps
+        )
+
+    def _on_step_committed_across_policy_boundary(self) -> None:
+        """
+        Called after optimizer.step() is committed across a policy boundary.
+        """
+        self._on_policy_advancement()
 
     def mark_iteration_end(self) -> bool:
         """
@@ -582,16 +689,14 @@ class StepTxnOrchestrator:
         self._restore_started = False
         self._need_restore.clear()
         self._set_quiesce(False)
-        self._skip_step_this_iter = False
         self._at_policy_boundary = False
-        self._num_policy_boundary_steps_remained = 0
-        self._num_zero_grad_procs = 0
+        self.dp_pg.reset_contributed()
 
     def after_successful_commit(self) -> None:
         """Training loop must call this after a successful optimizer.step()."""
         # if self.at_policy_boundary:
-        if self.is_last_step_at_policy_boundary:
-            self._policy.advance_policy()
+        if self.at_policy_boundary:
+            self._on_step_committed_across_policy_boundary()
             logger.debug(
                 f"[Rank {self._rank}] Advanced policy after last step at policy boundary"
             )
