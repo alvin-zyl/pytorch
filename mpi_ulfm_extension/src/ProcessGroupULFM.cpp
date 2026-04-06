@@ -7,6 +7,7 @@
 #include <iostream>
 #include <map>
 
+#include <cuda_runtime.h>
 #include <c10/core/DeviceGuard.h>
 #include <c10/util/irange.h>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
@@ -142,6 +143,12 @@ std::map<at::ScalarType, MPI_Datatype> mpiDatatype = {
     {at::kInt, MPI_INT},
     {at::kLong, MPI_LONG},
     {at::kShort, MPI_SHORT},
+    // 2-byte types treated as opaque 16-bit units.
+    // Correct for bit-copy ops (broadcast, allgather, scatter, send, recv).
+    // For allreduce on these types, upcast to float before MPI reduce (see allreduce impl).
+    {at::kBFloat16, MPI_UNSIGNED_SHORT},
+    {at::kHalf,     MPI_UNSIGNED_SHORT},
+    {at::kBool,     MPI_UNSIGNED_CHAR},
 };
 
 // Checking CUDA-aware MPI support, currently we only support CUDA aware
@@ -457,6 +464,16 @@ void ProcessGroupULFM::abort() {
 }
 
 void ProcessGroupULFM::runLoop() {
+  // Set CUDA device on the worker thread so OpenMPI's CUDA-aware layer
+  // can query the device context (cuCtxGetDevice) without error 201.
+  {
+    int device_count = 0;
+    auto err = cudaGetDeviceCount(&device_count);
+    if (err == cudaSuccess && device_count > 0) {
+      cudaSetDevice(rank_ % device_count);
+    }
+  }
+
   std::unique_lock<std::mutex> lock(pgMutex_);
 
   while (!stop_) {
@@ -565,7 +582,7 @@ c10::intrusive_ptr<Work> ProcessGroupULFM::broadcast(
 c10::intrusive_ptr<Work> ProcessGroupULFM::allreduce(
     std::vector<at::Tensor>& tensors,
     const AllreduceOptions& opts) {
-  
+
   checkSingleTensor(tensors);
 
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
@@ -573,13 +590,31 @@ c10::intrusive_ptr<Work> ProcessGroupULFM::allreduce(
         auto data = (entry->src)[0];
         c10::DeviceGuard guard(data.device());
         std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
+
+        // BF16/FP16 have no native MPI reduction op (MPI_UNSIGNED_SHORT would
+        // give wrong sums).  Upcast to FP32, reduce, then cast back.
+        const bool needs_upcast = (data.scalar_type() == at::kBFloat16 ||
+                                   data.scalar_type() == at::kHalf);
+        at::Tensor reduce_buf = needs_upcast ? data.data().to(at::kFloat) : data;
+
+        // ReduceOp::AVG has no native MPI equivalent; emulate with SUM + divide.
+        MPI_Op mpi_op = (opts.reduceOp == ReduceOp::AVG)
+            ? MPI_SUM
+            : mpiOp.at(opts.reduceOp);
         MPI_CHECK(MPI_Allreduce(
             MPI_IN_PLACE,
-            data.data_ptr(),
-            data.numel(),
-            mpiDatatype.at(data.scalar_type()),
-            mpiOp.at(opts.reduceOp),
+            reduce_buf.data_ptr(),
+            reduce_buf.numel(),
+            mpiDatatype.at(reduce_buf.scalar_type()),
+            mpi_op,
             pgComm_));
+        if (opts.reduceOp == ReduceOp::AVG) {
+          reduce_buf.div_(static_cast<double>(size_));
+        }
+        if (needs_upcast) {
+          // Write result back into original tensor without triggering autograd.
+          data.data().copy_(reduce_buf);
+        }
       };
   auto entry =
       std::make_unique<WorkEntry>(&tensors, &tensors, std::move(runFunc));
@@ -601,21 +636,25 @@ c10::intrusive_ptr<Work> ProcessGroupULFM::ulfm_allreduce(
       [opts, ulfm_opts, this, epoch_at_enqueue](std::unique_ptr<WorkEntry>& entry) {
         auto data = (entry->src)[0];
         c10::DeviceGuard guard(data.device());
+        ULFM_LOG_DEBUG(currentRank_, "ulfm_allreduce: waiting for pgGlobalMutex_");
         std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
-        
+        ULFM_LOG_DEBUG(currentRank_, "ulfm_allreduce: pgGlobalMutex_ acquired");
+
         // Get the WorkULFM instance to record failures
         WorkULFM* ulfm_work = static_cast<WorkULFM*>(entry->ulfmWork);
 
         // Early NOOP if quiesced
-        if (is_quiesced()) { 
-          if (ulfm_work) ulfm_work->markNoop(); 
+        if (is_quiesced()) {
+          if (ulfm_work) ulfm_work->markNoop();
           ULFM_LOG_INFO(currentRank_, "Quiesced before entering ULFM logic, marked as NOOP");
-          return; 
+          return;
         }
-        
+
         // Use the new modular failure recovery system
+        ULFM_LOG_DEBUG(currentRank_, "ulfm_allreduce: entering detect_and_recover_failures");
         std::vector<int> failed_ranks;
         RecoveryResult recovery_success = detect_and_recover_failures(ulfm_opts.auto_repair, &failed_ranks, ulfm_opts.max_retries);
+        ULFM_LOG_DEBUG(currentRank_, "ulfm_allreduce: detect_and_recover_failures returned");
 
         // Always record failure for inspection if any were detected
         if (recovery_success.has_failure()) {
@@ -657,14 +696,23 @@ c10::intrusive_ptr<Work> ProcessGroupULFM::ulfm_allreduce(
           data.zero_();
           ULFM_LOG_DEBUG(currentRank_, "Spare process zeroing out grad data");
         }
-        // printf("[Rank %d] ULFM All Reduce\n", rank_);
+
+        // BF16/FP16 have no native MPI reduction op — upcast to FP32 for reduce.
+        const bool needs_upcast = (data.scalar_type() == at::kBFloat16 ||
+                                   data.scalar_type() == at::kHalf);
+        at::Tensor reduce_buf = needs_upcast ? data.data().to(at::kFloat) : data;
+
         MPI_CHECK(MPI_Allreduce(
             MPI_IN_PLACE,
-            data.data_ptr(),
-            data.numel(),
-            mpiDatatype.at(data.scalar_type()),
+            reduce_buf.data_ptr(),
+            reduce_buf.numel(),
+            mpiDatatype.at(reduce_buf.scalar_type()),
             mpiOp.at(opts.reduceOp),
             pgComm_));
+
+        if (needs_upcast) {
+          data.data().copy_(reduce_buf);
+        }
       };
   auto entry =
       std::make_unique<WorkEntry>(&tensors, &tensors, std::move(runFunc));
@@ -1215,7 +1263,9 @@ c10::intrusive_ptr<Work> ProcessGroupULFM::consensus(const ULFMOptions& ulfm_opt
 
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
       [ulfm_opts, this, epoch_at_enqueue](std::unique_ptr<WorkEntry>& entry) {
+        ULFM_LOG_DEBUG(currentRank_, "consensus: waiting for pgGlobalMutex_");
         std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
+        ULFM_LOG_DEBUG(currentRank_, "consensus: pgGlobalMutex_ acquired");
 
         // Get the WorkULFM instance to record failures
         WorkULFM* ulfm_work = static_cast<WorkULFM*>(entry->ulfmWork);
