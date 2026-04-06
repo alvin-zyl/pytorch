@@ -6,10 +6,10 @@ import torch
 import torch.distributed as dist
 import ulfm_collectives as ULFM
 
-from policy import GradRestoreMode
-from ulfm_work_types import ULFMWorkType
+from .policy import GradRestoreMode
+from .ulfm_work_types import ULFMWorkType
 
-from policy import (
+from .policy import (
     FailureEvent,
     PolicyDecision,
     FaultTolerancePolicy,
@@ -290,7 +290,7 @@ class StepTxnOrchestrator:
             Exception: Re-raises any exception encountered during failure handling
         """
         # Import FailureEvent here to avoid circular imports
-        from policy import FailureEvent
+        from .policy import FailureEvent
 
         # A work could be marked as NOOP even after comm being repaired
         if (

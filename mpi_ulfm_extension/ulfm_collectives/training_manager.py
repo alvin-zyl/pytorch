@@ -21,9 +21,9 @@ except ImportError:
     raise ImportError(
         "ULFM collectives extension not found. Please build the extension first."
     )
-from orchestrator import StepTxnOrchestrator
-from ulfm_hook import create_ulfm_recovery_hook, HookState
-from policy import create_policy, GradRestoreMode
+from .orchestrator import StepTxnOrchestrator
+from .ulfm_hook import create_ulfm_recovery_hook, HookState
+from .policy import create_policy, GradRestoreMode
 
 # Logger will be configured based on CLI arguments
 logger = logging.getLogger(__name__)

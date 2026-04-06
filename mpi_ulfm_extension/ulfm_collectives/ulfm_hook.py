@@ -7,6 +7,7 @@ with ULFM (User Level Failure Mitigation). The hook integrates with PyTorch DDP 
 StepTxnOrchestrator for gradient snapshotting and recovery.
 """
 
+import contextlib
 import os
 import signal
 import logging
@@ -16,7 +17,7 @@ from dataclasses import dataclass
 from typing import Union, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from policy import FaultTolerancePolicy
+    from .policy import FaultTolerancePolicy
 
 try:
     import ulfm_collectives as ULFM
@@ -25,7 +26,8 @@ except ImportError:
         "ULFM collectives extension not found. Please build the extension first."
     )
 
-from orchestrator import StepTxnOrchestrator
+from .orchestrator import StepTxnOrchestrator
+from .failure_simulator import get_failure_simulator
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +82,12 @@ def create_ulfm_recovery_hook(ulfm_opts: ULFM.ULFMOptions = None):
         """ULFM communication hook with comprehensive recovery logic."""
         pg = hstate.pg
         orch = hstate.orchestrator
+        bucket_index = bucket.index()
+
+        logger.debug(
+            f"[Rank {orch._rank}] Hook entered for bucket {bucket_index}, "
+            f"numel={bucket.buffer().numel()}, dtype={bucket.buffer().dtype}"
+        )
 
         # 1) If a previous failure quiesced comms, NOOP this bucket
         if getattr(pg, "is_quiesced", lambda: False)():
@@ -90,33 +98,51 @@ def create_ulfm_recovery_hook(ulfm_opts: ULFM.ULFMOptions = None):
             fut.set_result(bucket.buffer())
             return fut
 
-        # 2) Snapshot the entire bucket buffer (pre-reduce)
-        bucket_index = bucket.index()
+        # 2) Ensure all GPU work (TP allreduces from pipeline fwd/bwd) has
+        #    truly completed before we snapshot or enter MPI.  Without this,
+        #    the CPU can race ahead of a stuck GPU stream: if a TP partner is
+        #    dead the NCCL ops on this rank's stream never finish, but the CPU
+        #    would still enter MPI — dragging the healthy DP partner into a
+        #    blocked collective.  With the sync, a stuck rank blocks HERE
+        #    (never enters MPI) and eventually dies via NCCL watchdog, letting
+        #    the DP partner discover the failure through ULFM comm_agree.
+        torch.cuda.synchronize()
+
+        # 3) Snapshot the entire bucket buffer (pre-reduce)
+        logger.debug(
+            f"[Rank {orch._rank}] Snapshotting bucket {bucket_index} before allreduce"
+        )
         orch.on_bucket_snapshot(bucket.buffer(), bucket_index, pg)
 
         # work = dist.ulfm_all_reduce(bucket.buffer(), async_op=True, ulfm_opts=ulfm_opts)
+        logger.debug(
+            f"[Rank {orch._rank}] Submitting ulfm_allreduce for bucket {bucket_index}"
+        )
         work = pg.ulfm_allreduce([bucket.buffer()], opts, ulfm_opts)
 
         def on_done(fut):
-            # if (
-            #     orch._rank == 1
-            #     and orch.get_hook_counter() > 0
-            #     and orch._current_macrobatch_idx == 2
-            # ):
-            #     logger.warning(
-            #         f"[Rank {orch._rank}] Simulating process failure in mid of grad sync, hook counter {orch.get_hook_counter()}"
-            #     )
-            #     os.kill(os.getpid(), signal.SIGKILL)
-
+            logger.debug(
+                f"[Rank {orch._rank}] Allreduce completed for bucket {bucket_index}, "
+                f"entering work completion handler"
+            )
             # Use orchestrator's unified entry point for handling work completion
             # This encapsulates all failure detection, policy consultation, and recovery logic
-            orch.handle_work_completion(
-                work=work,
-                bucket_index=bucket_index,
-            )
+            # get_failure_simulator() is called here (not at hook-registration time) so that
+            # simulators set after DDP construction are picked up correctly.
+            _sim = get_failure_simulator()
+            ctx = _sim.may_fail_here("post-allreduce") if _sim is not None else contextlib.nullcontext()
+            with ctx:
+                orch.handle_work_completion(
+                    work=work,
+                    bucket_index=bucket_index,
+                )
 
             # Increment hook invocation counter
             orch.increment_hook_counter()
+            logger.debug(
+                f"[Rank {orch._rank}] Hook done for bucket {bucket_index}, "
+                f"hook_count={orch._hook_invocation_counter}"
+            )
 
             return fut.value()[0]
 

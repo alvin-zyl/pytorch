@@ -44,8 +44,14 @@ import logging
 import time
 from contextlib import contextmanager
 from functools import wraps
-from typing import Optional, Set, List
+from typing import Optional, Set, List, Dict, Tuple
 from dataclasses import dataclass, field
+
+try:
+    import yaml
+    _YAML_AVAILABLE = True
+except ImportError:
+    _YAML_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -139,12 +145,15 @@ class FailureSimulator:
         total_minibatches: int = 100,
         target_ranks: Optional[Set[int]] = None,
         enabled: bool = True,
+        config_path: Optional[str] = None,
+        start_minibatch: int = 0,
     ):
         self.seed = seed
         self.desired_failures = desired_failures
         self.total_minibatches = total_minibatches
         self.target_ranks = target_ranks
         self.enabled = enabled
+        self.start_minibatch = max(1, start_minibatch)  # minibatch 0 always skipped
 
         # Computed in initialize() once we know world_size
         self._failure_probability: float = 0.0
@@ -158,6 +167,14 @@ class FailureSimulator:
 
         # Registered failure locations (populated by decorators/context managers)
         self._registered_locations: Set[str] = set()
+
+        # Config-driven locations: maps location name -> explicit probability or None.
+        # None means "auto": gets an equal share of whatever probability remains after
+        # summing the explicitly specified ones.
+        # If _config_locations is None (no config given), fall back to _registered_locations.
+        self._config_locations: Optional[Dict[str, Optional[float]]] = None
+        if config_path is not None:
+            self._config_locations = self._load_config(config_path)
 
     def initialize(self, rank: int, world_size: int) -> None:
         """
@@ -184,9 +201,10 @@ class FailureSimulator:
             else:
                 num_target_ranks = world_size
 
-            # Compute probability to achieve desired_failures
+            # Compute probability over the effective window (after start_minibatch)
+            effective_minibatches = max(1, self.total_minibatches - self.start_minibatch)
             self._failure_probability = self.compute_probability(
-                total_minibatches=self.total_minibatches,
+                total_minibatches=effective_minibatches,
                 desired_failures=self.desired_failures,
                 num_target_ranks=num_target_ranks,
             )
@@ -199,6 +217,8 @@ class FailureSimulator:
                 f"[Rank {rank}] FailureSimulator initialized: "
                 f"seed={self.seed}, desired_failures={self.desired_failures}, "
                 f"total_minibatches={self.total_minibatches}, "
+                f"start_minibatch={self.start_minibatch}, "
+                f"effective_window={effective_minibatches}, "
                 f"computed_probability={self._failure_probability:.6f}, "
                 f"target_ranks={self.target_ranks}"
             )
@@ -220,6 +240,118 @@ class FailureSimulator:
         """Get all registered failure locations."""
         with self._lock:
             return self._registered_locations.copy()
+
+    def _load_config(self, path: str) -> Dict[str, Optional[float]]:
+        """
+        Load failure locations (and optional per-location probabilities) from a YAML file.
+
+        Expected format::
+
+            locations:
+              ddp_allreduce: 0.5      # explicit probability (fraction of failures)
+              forward_pass: 0.3       # explicit probability
+              backward:               # null/absent → auto (even share of remainder)
+
+        The probability values are *selection weights*: they describe what fraction
+        of the scheduled failures should target that location.  Values must be in
+        [0, 1] and their sum must not exceed 1.0.  Locations whose value is null
+        or omitted receive an equal share of whatever fraction remains.
+
+        Args:
+            path: Path to the YAML config file.
+
+        Returns:
+            Dict mapping location name to explicit probability (float) or None (auto).
+
+        Raises:
+            ImportError: if PyYAML is not installed.
+            ValueError: if the config is malformed or probabilities exceed 1.0.
+        """
+        if not _YAML_AVAILABLE:
+            raise ImportError(
+                "PyYAML is required to load a failure simulator config. "
+                "Install it with: pip install pyyaml"
+            )
+
+        with open(path, "r") as f:
+            raw = yaml.safe_load(f)
+
+        if not isinstance(raw, dict) or "locations" not in raw:
+            raise ValueError(
+                f"Config file '{path}' must have a top-level 'locations' key."
+            )
+
+        locations_raw = raw["locations"]
+        if not isinstance(locations_raw, dict):
+            raise ValueError(
+                f"'locations' in '{path}' must be a mapping of name -> probability."
+            )
+
+        result: Dict[str, Optional[float]] = {}
+        for name, value in locations_raw.items():
+            if value is None:
+                result[name] = None
+            else:
+                p = float(value)
+                if not (0.0 <= p <= 1.0):
+                    raise ValueError(
+                        f"Probability for location '{name}' must be in [0, 1], got {p}."
+                    )
+                result[name] = p
+
+        # Validate sum of explicit probs
+        explicit_sum = sum(p for p in result.values() if p is not None)
+        if explicit_sum > 1.0 + 1e-9:
+            raise ValueError(
+                f"Sum of explicit location probabilities ({explicit_sum:.4f}) exceeds 1.0."
+            )
+
+        logger.info(
+            f"Loaded failure simulator config from '{path}': {list(result.keys())}"
+        )
+        return result
+
+    def _get_active_locations_with_weights(self) -> Dict[str, float]:
+        """
+        Return the set of active locations and their selection weights (sum = 1.0).
+
+        If a YAML config was provided:
+          - Only config locations are eligible.
+          - Explicit probabilities are used directly as weights.
+          - Locations with no explicit probability share the remaining weight evenly.
+
+        If no config was provided:
+          - All registered locations are eligible with uniform weights.
+
+        Must be called with self._lock held.
+        """
+        if self._config_locations is not None:
+            locations = self._config_locations
+        else:
+            n = len(self._registered_locations)
+            if n == 0:
+                return {}
+            w = 1.0 / n
+            return {loc: w for loc in self._registered_locations}
+
+        if not locations:
+            return {}
+
+        explicit: Dict[str, float] = {
+            loc: p for loc, p in locations.items() if p is not None
+        }
+        auto_locs: List[str] = [loc for loc, p in locations.items() if p is None]
+
+        explicit_sum = sum(explicit.values())
+        remaining = max(0.0, 1.0 - explicit_sum)
+
+        weights = dict(explicit)
+        if auto_locs:
+            auto_weight = remaining / len(auto_locs)
+            for loc in auto_locs:
+                weights[loc] = auto_weight
+
+        return weights
 
     def begin_minibatch(self, minibatch: int) -> None:
         """
@@ -249,20 +381,27 @@ class FailureSimulator:
                 return
             if self.target_ranks is not None and self._state.rank not in self.target_ranks:
                 return
-            if not self._registered_locations:
-                logger.warning("No locations registered, cannot inject failure")
+            # Determine active locations; prefer config over registered
+            active_weights = self._get_active_locations_with_weights()
+            if not active_weights:
+                logger.warning("No locations available for failure injection, cannot inject failure")
                 return
 
             # Skip first minibatch to allow location registration to complete
             if minibatch == 0:
                 return
 
+            # Don't inject before start_minibatch
+            if minibatch < self.start_minibatch:
+                return
+
             # Decide if this minibatch should fail
             if self._rng.random() < self._failure_probability:
                 self._state.should_fail_this_minibatch = True
-                # Randomly pick one registered location
-                locations = list(self._registered_locations)
-                self._state.target_location = self._rng.choice(locations)
+                # Weighted random selection of target location
+                loc_names = list(active_weights.keys())
+                loc_weights = [active_weights[loc] for loc in loc_names]
+                self._state.target_location = self._rng.choices(loc_names, weights=loc_weights, k=1)[0]
                 logger.debug(
                     f"[Rank {self._state.rank}] Minibatch {minibatch}: "
                     f"scheduled failure at '{self._state.target_location}'"
@@ -375,6 +514,8 @@ class FailureSimulator:
                 "total_minibatches": self.total_minibatches,
                 "failure_probability": self._failure_probability,
                 "registered_locations": list(self._registered_locations),
+                "config_locations": self._config_locations,
+                "active_weights": self._get_active_locations_with_weights(),
                 "has_failed": self._has_failed,
                 "history": [
                     {
@@ -406,10 +547,11 @@ class FailureSimulator:
             logger.info(f"[Rank {self._state.rank}] FailureSimulator reset")
 
     def __repr__(self) -> str:
+        active = self._get_active_locations_with_weights()
         return (
             f"FailureSimulator(seed={self.seed}, desired_failures={self.desired_failures}, "
             f"total_minibatches={self.total_minibatches}, probability={self._failure_probability:.6f}, "
-            f"target_ranks={self.target_ranks}, locations={self._registered_locations}, "
+            f"target_ranks={self.target_ranks}, active_locations={active}, "
             f"enabled={self.enabled})"
         )
 
