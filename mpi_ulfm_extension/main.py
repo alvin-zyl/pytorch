@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import json
 import random
@@ -24,11 +25,29 @@ from pretraining_utils.dataloader import PreprocessedIterableDataset
 import datetime, pdb, pickle
 from torch.profiler import profile, ProfilerActivity
 
+try:
+    import ulfm_collectives as ULFM
+    from ulfm_collectives.training_manager import ULFMTrainingManager
+    from ulfm_collectives.failure_simulator import FailureSimulator, set_failure_simulator
+    _ULFM_AVAILABLE = True
+except ImportError:
+    _ULFM_AVAILABLE = False
+
 transformers.logging.set_verbosity_error()
 
 
 torch.backends.cuda.enable_mem_efficient_sdp(False)
 torch.backends.cuda.enable_flash_sdp(False)
+
+
+class LMWrapper(nn.Module):
+    """Wraps a causal LM to accept a single batch dict, as required by ULFMTrainingManager."""
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, batch):
+        return self.model(**batch)
 
 
 def get_rank():
@@ -52,7 +71,7 @@ def parse_args(args):
     parser.add_argument("--offline_mode", default=False, action="store_true")
     parser.add_argument("--continue_from", type=str, default=None)
     parser.add_argument("--batch_size", type=int, required=True)
-    parser.add_argument("--gradient_accumulation", type=int, default=None)
+    parser.add_argument("--gradient_accumulation", type=int, default=1)
     parser.add_argument("--total_batch_size", type=int, default=None)
     parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--optimizer", default="adamw")
@@ -98,6 +117,13 @@ def parse_args(args):
     parser.add_argument("--beta1", type=float, default=0.0)
     # disable ddp, single_gpu
     parser.add_argument("--single_gpu", default=False, action="store_true")
+    parser.add_argument(
+        "--failure_start_step",
+        type=int,
+        default=0,
+        help="Minibatch index at which the failure simulator begins injecting failures. "
+             "Useful to let training stabilize before testing fault tolerance.",
+    )
 
     args = parser.parse_args(args)
 
@@ -182,41 +208,49 @@ def main(args):
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    assert "LOCAL_RANK" in os.environ, "torchrun should set LOCAL_RANK"
-    global_rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID")))
-    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_PROCID")))
-    world_size = int(os.environ["WORLD_SIZE"])
+    dist.init_process_group(backend="ulfm")
+
+    global_rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK",
+                                    str(global_rank % max(torch.cuda.device_count(), 1))))
     torch.cuda.set_device(local_rank)
 
     logger.info(
         f"Global rank {global_rank}, local rank {local_rank}, device: {torch.cuda.current_device()}"
     )
 
-    dist.init_process_group(
-        backend="nccl",
-        rank=global_rank,
-        world_size=world_size,
-        timeout=datetime.timedelta(seconds=3600),
-    )
-
     logger.info("Process group initialized")
     device = f"cuda:{local_rank}"
 
+    if _ULFM_AVAILABLE and not args.single_gpu:
+        sim = FailureSimulator(
+            seed=42,
+            desired_failures=1,
+            total_minibatches=100 * args.gradient_accumulation,
+            target_ranks={1},
+            config_path=None,
+            start_minibatch=args.failure_start_step,
+        )
+        set_failure_simulator(sim)
+        sim.initialize(rank=global_rank, world_size=world_size)
+    else:
+        sim = None
+
     if args.total_batch_size is not None:
-        if args.gradient_accumulation is None:
-            assert (
-                args.total_batch_size % world_size == 0
-            ), "total_batch_size must be divisible by world_size"
-            args.gradient_accumulation = args.total_batch_size // (
-                args.batch_size * world_size
+        assert (
+            args.total_batch_size % world_size == 0
+        ), "total_batch_size must be divisible by world_size"
+        args.gradient_accumulation = args.total_batch_size // (
+            args.batch_size * world_size
+        )
+        if is_main_process():
+            logger.info(
+                f"{args.gradient_accumulation}-{world_size}-{args.total_batch_size}-{args.batch_size}"
             )
-            if is_main_process():
-                logger.info(
-                    f"{args.gradient_accumulation}-{world_size}-{args.total_batch_size}-{args.batch_size}"
-                )
-            assert (
-                args.gradient_accumulation > 0
-            ), "gradient_accumulation must be greater than 0"
+        assert (
+            args.gradient_accumulation > 0
+        ), "gradient_accumulation must be greater than 0"
 
     assert (
         args.gradient_accumulation * args.batch_size * world_size
@@ -246,7 +280,7 @@ def main(args):
 
     if args.offline_mode:
         logger.info("Loading tokenized data from disk")
-        data = datasets.load_from_disk("/datasets/c4/tokenized")
+        data = datasets.load_from_disk("/data/ziyueliu/datasets/c4/tokenized")
         logger.info("Finished loading from disk")
     else:
         data = datasets.load_dataset("allenai/c4", "en", split="train", streaming=True)
@@ -429,16 +463,29 @@ def main(args):
     if global_rank == 0:
         wandb.config.update(run_config, allow_val_change=True)
         wandb.save(os.path.abspath(__file__), policy="now")  # save current script
+        try:
+            _tqdm_file = open("/dev/tty", "w")
+        except (OSError, IOError):
+            _tqdm_file = sys.stderr
         pbar = tqdm(
-            total=args.num_training_steps - update_step, desc="Update steps", ncols=80
+            total=args.num_training_steps - update_step,
+            desc="Update steps",
+            dynamic_ncols=True,
+            file=_tqdm_file,
         )
 
+    lm_criterion = lambda output, _: output.loss
+
     if not args.single_gpu:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            broadcast_buffers=False,
+        if not _ULFM_AVAILABLE:
+            raise RuntimeError("ulfm_collectives not available; cannot run distributed training without ULFM.")
+        training_manager = ULFMTrainingManager(
+            LMWrapper(model),
+            grad_accum_steps=args.gradient_accumulation,
+            failure_strategy="continue",
+            enable_auto_repair=True,
+            policy_type="static",
+            initial_world_size=world_size,
         )
 
     # global steps and others are defined above
@@ -454,7 +501,13 @@ def main(args):
     if global_rank == 0:
         logger.info(f"Maximum memory allocated before training: {max_memory} bytes\n")
     torch.cuda.reset_peak_memory_stats()
-    # pdb.set_trace()
+
+    if not args.single_gpu:
+        dist.barrier()
+
+    if global_rank == 0:
+        print(f"Rank {global_rank} starting training loop.")
+
     for batch_idx, batch in enumerate(train_dataloader):
         if batch_idx // args.gradient_accumulation < update_step:
             # Skipping data that are already seen in previous steps
@@ -467,7 +520,8 @@ def main(args):
             logger.info(
                 f"Reached max number of update steps (f{args.num_training_steps}). Stopping training."
             )
-            print(f"Rank {global_rank} stopping training.")
+            if global_rank == 0:
+                print(f"Stopping training.")
             break
         batch = {k: v.to(device) for k, v in batch.items()}
         batch["labels"] = (
@@ -476,33 +530,40 @@ def main(args):
         batch["labels"][batch["labels"] == pad_idx] = -100
         tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
 
-        loss = model(**batch).loss
-        scaled_loss = loss / args.gradient_accumulation
-
-        scaled_loss.backward()
-
-        if global_step % args.gradient_accumulation != 0:
-            continue
-
-        #######
-        if args.grad_clipping != 0.0:
-            torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping)
-
-        grad_norm = sum(
-            [
-                torch.norm(p.grad.clone().detach().cpu())
-                for p in model.parameters()
-                if p.grad is not None
-            ]
-        )
+        if args.single_gpu:
+            loss = model(**batch).loss
+            scaled_loss = loss / args.gradient_accumulation
+            scaled_loss.backward()
+            if global_step % args.gradient_accumulation != 0:
+                continue
+            stepped = True
+            if args.grad_clipping != 0.0:
+                torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping)
+            grad_norm = sum(
+                [
+                    torch.norm(p.grad.clone().detach().cpu())
+                    for p in model.parameters()
+                    if p.grad is not None
+                ]
+            )
+            if not layer_wise_flag:
+                optimizer.step()
+                optimizer.zero_grad()
+        else:
+            sim.begin_minibatch(batch_idx)
+            with sim.may_fail_here("pre-forward"):
+                loss, stepped = training_manager.train_step(
+                    batch_idx, batch, None, lm_criterion, optimizer
+                )
+            if not stepped:
+                continue
+            grad_norm = 0.0
 
         if global_rank == 0:
             pbar.update(1)
 
         if not layer_wise_flag:
-            optimizer.step()
             scheduler.step()
-            optimizer.zero_grad()
 
         update_step += 1
         update_time = time.time() - update_time
@@ -518,7 +579,7 @@ def main(args):
                 f"Saving model and optimizer to {current_model_directory}, update step {update_step}"
             )
             os.makedirs(args.save_dir, exist_ok=True)
-            model.module.save_pretrained(
+            model.save_pretrained(
                 current_model_directory, max_shard_size="100GB"
             )
 
@@ -592,7 +653,7 @@ def main(args):
         if global_rank == 0:
             wandb.log(
                 {
-                    "loss": loss.item(),
+                    "loss": loss.item() if isinstance(loss, torch.Tensor) else loss,
                     "lr": lr,
                     "update_step": update_step,
                     "tokens_seen": tokens_seen,
@@ -613,6 +674,8 @@ def main(args):
     logger.info("Training finished")
     if global_rank == 0:
         pbar.close()
+        if _tqdm_file is not sys.stderr:
+            _tqdm_file.close()
 
     current_model_directory = f"{args.save_dir}/model_{update_step}"
     if global_rank == 0 and not os.path.exists(current_model_directory):
@@ -678,7 +741,8 @@ def main(args):
         )
 
     logger.info("Script finished successfully")
-    print(f"Rank {global_rank} finished successfully")
+    if global_rank == 0:
+        print("Finished successfully")
 
 
 if __name__ == "__main__":
