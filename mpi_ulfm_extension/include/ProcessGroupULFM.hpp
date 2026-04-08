@@ -427,7 +427,7 @@ class TORCH_API ProcessGroupULFM : public ProcessGroup {
     target_contribution_.store(value, std::memory_order_release);
   }
   void increment_target_contribution(int64_t delta = 1) {
-    TORCH_CHECK(delta > 0, "target_contribution delta must be positive");
+    TORCH_CHECK(delta >= 0, "target_contribution delta must non negative");
     target_contribution_.fetch_add(delta, std::memory_order_relaxed);
   }
 
