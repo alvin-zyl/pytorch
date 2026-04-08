@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import threading
 from typing import List, Optional, Set, Tuple, TYPE_CHECKING
@@ -8,6 +9,7 @@ import ulfm_collectives as ULFM
 
 from .policy import GradRestoreMode
 from .ulfm_work_types import ULFMWorkType
+from .failure_simulator import get_failure_simulator
 
 from .policy import (
     FailureEvent,
@@ -80,6 +82,10 @@ class StepTxnOrchestrator:
 
         # Hook invocation counter (used to detect gradient corruption)
         self._hook_invocation_counter = 0
+
+        # Deferred bucket queue: populated by the deferred hook during backward,
+        # fired after the pipeline stage completes via fire_deferred_allreduces().
+        self._deferred_buckets: List[Tuple[torch.Tensor, int]] = []
 
         # Training progression (microbatch index / total in accumulation window / macrobatch index)
         self._current_microbatch_idx = 0
@@ -701,3 +707,60 @@ class StepTxnOrchestrator:
                 f"[Rank {self._rank}] Advanced policy after last step at policy boundary"
             )
         self.mark_iteration_end()
+
+    # ------------------------------------------------------------------ #
+    # Deferred bucket allreduce (for pipeline-parallel training)
+    # ------------------------------------------------------------------ #
+
+    def queue_deferred_bucket(self, buffer: torch.Tensor, bucket_index: int) -> None:
+        """Queue a bucket for deferred allreduce (called by deferred hook)."""
+        self._deferred_buckets.append((buffer, bucket_index))
+        logger.debug(
+            f"[Rank {self._rank}] Queued deferred bucket {bucket_index} "
+            f"(total queued: {len(self._deferred_buckets)})"
+        )
+
+    def fire_deferred_allreduces(self) -> None:
+        """
+        Fire all deferred bucket allreduces.
+
+        Call after the pipeline stage and replica-consistency gate complete.
+        Each bucket is allreduced in-place via ULFM, with per-bucket failure
+        handling through handle_work_completion().
+        """
+        if not self._deferred_buckets:
+            logger.debug(f"[Rank {self._rank}] No deferred buckets to allreduce")
+            return
+
+        # Ensure all GPU work (backward, TP allreduces) is complete
+        torch.cuda.synchronize()
+
+        opts = torch.distributed.AllreduceOptions()
+        opts.reduceOp = torch.distributed.ReduceOp.SUM
+        ulfm_opts = self._ulfm_opts
+
+        logger.debug(
+            f"[Rank {self._rank}] Firing {len(self._deferred_buckets)} deferred allreduces"
+        )
+
+        for buffer, bucket_index in self._deferred_buckets:
+            work = self.dp_pg.ulfm_allreduce([buffer], opts=opts, ulfm_opts=ulfm_opts)
+            work.wait()
+
+            # Failure injection point (same location as the original hook's on_done)
+            _sim = get_failure_simulator()
+            ctx = (
+                _sim.may_fail_here("post-allreduce")
+                if _sim is not None
+                else contextlib.nullcontext()
+            )
+            with ctx:
+                self.handle_work_completion(work, bucket_index=bucket_index)
+
+            self.increment_hook_counter()
+
+        self._deferred_buckets.clear()
+
+    def clear_deferred_buckets(self) -> None:
+        """Clear the deferred bucket queue (e.g. on iteration reset)."""
+        self._deferred_buckets.clear()

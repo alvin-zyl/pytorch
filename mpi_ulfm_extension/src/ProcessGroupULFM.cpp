@@ -563,6 +563,13 @@ c10::intrusive_ptr<Work> ProcessGroupULFM::broadcast(
       [opts, this](std::unique_ptr<WorkEntry>& entry) {
         auto data = (entry->src)[0];
         c10::DeviceGuard guard(data.device());
+        // Ensure any pending async GPU ops (e.g. non_blocking CPU→GPU copies
+        // from DDP's sync_bucket_indices) have completed before MPI reads
+        // the buffer.  MPI_Bcast is a host-side call and does not
+        // synchronize with the CUDA stream.
+        if (data.is_cuda()) {
+          cudaDeviceSynchronize();
+        }
         std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
         MPI_CHECK(MPI_Bcast(
             data.data_ptr(),
@@ -1390,20 +1397,29 @@ RecoveryResult ProcessGroupULFM::detect_and_recover_failures(bool auto_repair, s
 
   int num_failures = static_cast<int>(failed_ranks_comm.size());
 
-  // Step 3: Repair communicator if needed and requested
-  if (auto_repair) {
-    RecoveryResult repair_result = repair_communicator_internal();
-    if (!repair_result) {
-      ULFM_LOG_ERROR(currentRank_, repair_result.error_message);
-      return repair_result;
-    }
-    ULFM_LOG_INFO(currentRank_, "Failure detection and recovery completed successfully");
-    return RecoveryResult::Recovered(num_failures);
-  } else {
-    ULFM_LOG_WARN(currentRank_, "Repair needed but auto_repair disabled");
-    // Failure detected but not repaired (caller's choice)
-    return RecoveryResult::NotRecovered(num_failures);
+  RecoveryResult repair_result = repair_communicator_internal();
+  if (!repair_result) {
+    ULFM_LOG_ERROR(currentRank_, repair_result.error_message);
+    return repair_result;
   }
+  ULFM_LOG_INFO(currentRank_, "Failure detection and recovery completed successfully");
+  return RecoveryResult::Recovered(num_failures);
+
+
+  // Step 3: Repair communicator if needed and requested
+  // if (auto_repair) {
+  //   RecoveryResult repair_result = repair_communicator_internal();
+  //   if (!repair_result) {
+  //     ULFM_LOG_ERROR(currentRank_, repair_result.error_message);
+  //     return repair_result;
+  //   }
+  //   ULFM_LOG_INFO(currentRank_, "Failure detection and recovery completed successfully");
+  //   return RecoveryResult::Recovered(num_failures);
+  // } else {
+  //   ULFM_LOG_WARN(currentRank_, "Repair needed but auto_repair disabled");
+  //   // Failure detected but not repaired (caller's choice)
+  //   return RecoveryResult::NotRecovered(num_failures);
+  // }
 }
 
 // Step 1: Notice failure (comm_agree first - best practice)

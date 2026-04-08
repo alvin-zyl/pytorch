@@ -149,3 +149,59 @@ def create_ulfm_recovery_hook(ulfm_opts: ULFM.ULFMOptions = None):
         return work.get_future().then(on_done)
 
     return hook
+
+
+def create_ulfm_deferred_hook(ulfm_opts: ULFM.ULFMOptions = None):
+    """
+    Create a deferred ULFM communication hook for pipeline-parallel training.
+
+    The hook fires during the last microbatch's backward pass (per DDP bucketing)
+    but does NOT submit MPI work.  Instead it:
+      1. Snapshots the bucket buffer (for failure restoration)
+      2. Queues the bucket reference on the orchestrator's deferred list
+      3. Returns an immediately-resolved Future so finalize_backward never blocks
+
+    The actual ULFM allreduce is fired later via
+    ``orchestrator.fire_deferred_allreduces()`` after the pipeline stage and
+    replica-consistency gate complete.
+
+    Returns:
+        Callable hook compatible with DDP.register_comm_hook()
+    """
+    ulfm_opts = ulfm_opts if ulfm_opts is not None else ULFM.ULFMOptions()
+
+    def hook(hstate: HookState, bucket: dist.GradBucket):
+        pg = hstate.pg
+        orch = hstate.orchestrator
+        bucket_index = bucket.index()
+
+        logger.debug(
+            f"[Rank {orch._rank}] Deferred hook entered for bucket {bucket_index}, "
+            f"numel={bucket.buffer().numel()}, dtype={bucket.buffer().dtype}"
+        )
+
+        # If comms are quiesced, return immediately (same as recovery hook)
+        if getattr(pg, "is_quiesced", lambda: False)():
+            logger.warning(
+                f"[Rank {orch._rank}] Communicator quiesced — skipping bucket {bucket_index}"
+            )
+            fut = torch.futures.Future()
+            fut.set_result(bucket.buffer())
+            return fut
+
+        # Snapshot for restoration on failure (clone runs on current CUDA stream,
+        # ordered after the backward that produced this bucket's gradients —
+        # no cuda.synchronize needed here)
+        orch.on_bucket_snapshot(bucket.buffer(), bucket_index, pg)
+
+        # Queue for deferred allreduce (fired after PP completes)
+        orch.queue_deferred_bucket(bucket.buffer(), bucket_index)
+
+        # Return pre-resolved Future with the *same* bucket buffer tensor.
+        # finalize_backward's alias check (bucket_view_in.is_alias_of(bucket_view_out))
+        # passes → no copy → effectively a no-op.
+        fut = torch.futures.Future()
+        fut.set_result(bucket.buffer())
+        return fut
+
+    return hook
