@@ -214,16 +214,16 @@ def create_ulfm_fp32_deferred_hook(accumulator, param_id_to_name: dict):
     """
     Create a deferred ULFM hook that accumulates bf16 grads into fp32 buffers.
 
-    Combines the fp32 accumulation logic from nanotron's get_fp32_accum_hook()
-    with the deferred allreduce pattern:
+    Exploits the fact that a DDP bucket's fp32 grad views form a contiguous
+    slice of the accumulator's `_contiguous_fp32_grad_buffer` (DDP fills
+    buckets in reverse param-registration order, never skipping). The hook:
       1. Converts bf16 bucket grads → fp32 in the accumulator's buffer (add_)
-      2. Builds a contiguous fp32 buffer for the bucket's parameters
-      3. Snapshots the fp32 buffer for failure recovery
-      4. Queues the fp32 buffer for deferred ULFM allreduce
+      2. Computes the [min_offset, min_offset+total_numel) slice covering the
+         bucket's params and asserts it is gap-free
+      3. Snapshots that slice (clone) for failure rollback
+      4. Queues the slice view (aliased to the real accumulator storage) for
+         deferred ULFM allreduce — allreduce lands in place, no scatter-back
       5. Returns pre-resolved Future (bf16 bucket unchanged for DDP)
-
-    After fire_deferred_allreduces(), the reduced fp32 values are scattered
-    back to the accumulator's per-param fp32 grad views.
 
     Args:
         accumulator: FP32GradientAccumulator instance
@@ -257,18 +257,38 @@ def create_ulfm_fp32_deferred_hook(accumulator, param_id_to_name: dict):
             fp32_grad_buffer = accumulator.get_grad_buffer(name)
             fp32_grad_buffer.add_(grad.view_as(fp32_grad_buffer))
 
-        # 2. Build contiguous fp32 buffer for this bucket's params
-        fp32_views = [
-            accumulator.get_grad_buffer(param_id_to_name[id(p)]).view(-1)
-            for p in bucket.parameters()
-        ]
-        fp32_bucket_buffer = torch.cat(fp32_views)
+        # 2. Compute contiguous slice of _contiguous_fp32_grad_buffer for this bucket
+        base = accumulator._contiguous_fp32_grad_buffer
+        base_ptr = base.data_ptr()
+        element_size = base.element_size()
 
-        # 3. Snapshot fp32 buffer for failure recovery
-        orch.on_bucket_snapshot(fp32_bucket_buffer, bucket_index, pg)
+        min_off = None
+        max_end = 0
+        total_numel = 0
+        for p in bucket.parameters():
+            v = accumulator.get_grad_buffer(param_id_to_name[id(p)]).view(-1)
+            el_off = (v.data_ptr() - base_ptr) // element_size
+            if min_off is None or el_off < min_off:
+                min_off = el_off
+            if el_off + v.numel() > max_end:
+                max_end = el_off + v.numel()
+            total_numel += v.numel()
 
-        # 4. Queue fp32 buffer + views for deferred allreduce with scatter-back
-        orch.queue_deferred_bucket_fp32(fp32_bucket_buffer, fp32_views, bucket_index)
+        assert max_end - min_off == total_numel, (
+            f"[Rank {orch._rank}] DDP bucket {bucket_index} is not contiguous in "
+            f"_contiguous_fp32_grad_buffer: span={max_end - min_off} vs sum(numel)={total_numel}. "
+            f"The slice shortcut requires DDP bucketing that preserves param-registration contiguity."
+        )
+
+        bucket_slice = base.narrow(0, min_off, total_numel)
+
+        # 3. Snapshot the slice for failure rollback (restore writes back into
+        #    the accumulator's real storage since bucket_slice aliases it)
+        orch.on_bucket_snapshot(bucket_slice, bucket_index, pg)
+
+        # 4. Queue the slice view for deferred allreduce — ULFM allreduce lands
+        #    in place in _contiguous_fp32_grad_buffer via this view. No scatter-back.
+        orch.queue_deferred_bucket(bucket_slice, bucket_index)
 
         # 5. Return pre-resolved Future (bf16 bucket unchanged for DDP)
         _sim = get_failure_simulator()
