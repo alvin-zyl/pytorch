@@ -18,7 +18,6 @@ from transformers import default_data_collator
 import datasets
 import datasets.distributed
 import wandb
-from tqdm import tqdm
 from loguru import logger
 from pretraining_utils import training_utils, args_utils
 from pretraining_utils.dataloader import PreprocessedIterableDataset
@@ -210,6 +209,11 @@ def main(args):
 
     dist.init_process_group(backend="ulfm")
 
+    # assert "LOCAL_RANK" in os.environ, "torchrun should set LOCAL_RANK"
+    # global_rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID")))
+    # local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_PROCID")))
+    # world_size = int(os.environ["WORLD_SIZE"])
+
     global_rank = dist.get_rank()
     world_size = dist.get_world_size()
     local_rank = int(os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK",
@@ -226,9 +230,9 @@ def main(args):
     if _ULFM_AVAILABLE and not args.single_gpu:
         sim = FailureSimulator(
             seed=42,
-            desired_failures=1,
+            desired_failures=0,
             total_minibatches=100 * args.gradient_accumulation,
-            target_ranks={1},
+            target_ranks={},
             config_path=None,
             start_minibatch=args.failure_start_step,
         )
@@ -280,7 +284,7 @@ def main(args):
 
     if args.offline_mode:
         logger.info("Loading tokenized data from disk")
-        data = datasets.load_from_disk("/data/ziyueliu/datasets/c4/tokenized")
+        data = datasets.load_from_disk("/eagle/TensorCompress/alvinliu/datasets/c4/tokenized")
         logger.info("Finished loading from disk")
     else:
         data = datasets.load_dataset("allenai/c4", "en", split="train", streaming=True)
@@ -463,16 +467,6 @@ def main(args):
     if global_rank == 0:
         wandb.config.update(run_config, allow_val_change=True)
         wandb.save(os.path.abspath(__file__), policy="now")  # save current script
-        try:
-            _tqdm_file = open("/dev/tty", "w")
-        except (OSError, IOError):
-            _tqdm_file = sys.stderr
-        pbar = tqdm(
-            total=args.num_training_steps - update_step,
-            desc="Update steps",
-            dynamic_ncols=True,
-            file=_tqdm_file,
-        )
 
     lm_criterion = lambda output, _: output.loss
 
@@ -560,7 +554,9 @@ def main(args):
             grad_norm = 0.0
 
         if global_rank == 0:
-            pbar.update(1)
+            logger.info(
+                f"Update step {update_step}/{args.num_training_steps}, global step {global_step}, loss: {loss.item() if isinstance(loss, torch.Tensor) else loss:.4f}"
+            )
 
         if not layer_wise_flag:
             scheduler.step()
@@ -672,10 +668,6 @@ def main(args):
     # END of training loop
     # ##############################
     logger.info("Training finished")
-    if global_rank == 0:
-        pbar.close()
-        if _tqdm_file is not sys.stderr:
-            _tqdm_file.close()
 
     current_model_directory = f"{args.save_dir}/model_{update_step}"
     if global_rank == 0 and not os.path.exists(current_model_directory):
