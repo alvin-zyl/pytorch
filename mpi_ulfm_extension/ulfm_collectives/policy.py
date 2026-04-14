@@ -469,6 +469,10 @@ class StaticWorldPolicy(FaultTolerancePolicy):
             self.grad_accum_steps += (
                 1  # Increase grad accum steps to be >= target batch size
             )
+        
+        # Important: _current_grad_accum_steps could be larger at the boundary, need to sync with advanced policy
+        self._current_grad_accum_steps = self.grad_accum_steps
+
         min_num_major_procs = (
             target_batch_size // self.grad_accum_steps
         )  # Mimimum procs for the new grad accum steps

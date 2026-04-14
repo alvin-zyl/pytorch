@@ -79,6 +79,7 @@ class StepTxnOrchestrator:
 
         # Optimizer decision flags
         self._at_policy_boundary = False
+        self._num_policy_boundary_steps = 0
 
         # Hook invocation counter (used to detect gradient corruption)
         self._hook_invocation_counter = 0
@@ -86,6 +87,13 @@ class StepTxnOrchestrator:
         # Deferred bucket queue: populated by the deferred hook during backward,
         # fired after the pipeline stage completes via fire_deferred_allreduces().
         self._deferred_buckets: List[Tuple[torch.Tensor, int]] = []
+        # FP32 scatter-back views: bucket_index → list of fp32 grad views
+        # Populated by queue_deferred_bucket_fp32(); after allreduce the reduced
+        # coalesced buffer is scattered back to these views.
+        self._deferred_fp32_views: dict = {}
+        # Saved fp32 views from last failed fire_deferred_allreduces —
+        # used by blocking restore to scatter back after re-reduction.
+        self._last_fp32_views: dict = {}
 
         # Training progression (microbatch index / total in accumulation window / macrobatch index)
         self._current_microbatch_idx = 0
@@ -123,6 +131,11 @@ class StepTxnOrchestrator:
     def at_policy_boundary(self) -> bool:
         """Check if we are at a policy boundary."""
         return self._at_policy_boundary
+
+    @property
+    def num_policy_boundary_steps(self) -> int:
+        """Number of extra microbatches needed at a policy boundary."""
+        return self._num_policy_boundary_steps
 
     @property
     def curr_grad_accum_steps(self) -> int:
@@ -434,6 +447,7 @@ class StepTxnOrchestrator:
 
         self.detect_policy_boundary(decision.at_policy_boundary)
         if self.at_policy_boundary:
+            self._num_policy_boundary_steps = decision.num_policy_boundary_steps or 0
             self.dp_pg.set_boundary_minor_split(
                 decision.num_nonzero_grad_procs,
                 decision.num_policy_boundary_steps,
@@ -616,6 +630,13 @@ class StepTxnOrchestrator:
                     continue
                 else:
                     successfully_reduced.add(bucket_idx)
+                    # FP32 scatter-back after successful re-reduction
+                    if bucket_idx in self._last_fp32_views:
+                        fp32_views = self._last_fp32_views[bucket_idx]
+                        offset = 0
+                        for fv in fp32_views:
+                            fv.copy_(view[offset : offset + fv.numel()])
+                            offset += fv.numel()
             else:
                 successfully_reduced.add(bucket_idx)
 
@@ -696,6 +717,8 @@ class StepTxnOrchestrator:
         self._need_restore.clear()
         self._set_quiesce(False)
         self._at_policy_boundary = False
+        self._num_policy_boundary_steps = 0
+        self._last_fp32_views.clear()
         self.dp_pg.reset_contributed()
 
     def after_successful_commit(self) -> None:
@@ -720,17 +743,39 @@ class StepTxnOrchestrator:
             f"(total queued: {len(self._deferred_buckets)})"
         )
 
-    def fire_deferred_allreduces(self) -> None:
+    def queue_deferred_bucket_fp32(
+        self,
+        coalesced_buffer: torch.Tensor,
+        fp32_views: list,
+        bucket_index: int,
+    ) -> None:
+        """Queue an fp32 bucket for deferred allreduce with scatter-back views.
+
+        After allreduce, the reduced coalesced_buffer is scattered back to
+        fp32_views (which are views into the FP32GradientAccumulator's buffer).
+        """
+        self._deferred_buckets.append((coalesced_buffer, bucket_index))
+        self._deferred_fp32_views[bucket_index] = fp32_views
+        logger.debug(
+            f"[Rank {self._rank}] Queued deferred FP32 bucket {bucket_index} "
+            f"({len(fp32_views)} views, total queued: {len(self._deferred_buckets)})"
+        )
+
+    def fire_deferred_allreduces(self) -> bool:
         """
         Fire all deferred bucket allreduces.
 
         Call after the pipeline stage and replica-consistency gate complete.
         Each bucket is allreduced in-place via ULFM, with per-bucket failure
         handling through handle_work_completion().
+
+        Returns True if all buckets succeeded, False if any failure occurred.
+        On failure, fp32 scatter-back is skipped for failed buckets so the
+        accumulator retains locally-correct accumulated values.
         """
         if not self._deferred_buckets:
             logger.debug(f"[Rank {self._rank}] No deferred buckets to allreduce")
-            return
+            return True
 
         # Ensure all GPU work (backward, TP allreduces) is complete
         torch.cuda.synchronize()
@@ -743,6 +788,7 @@ class StepTxnOrchestrator:
             f"[Rank {self._rank}] Firing {len(self._deferred_buckets)} deferred allreduces"
         )
 
+        any_failure = False
         for buffer, bucket_index in self._deferred_buckets:
             work = self.dp_pg.ulfm_allreduce([buffer], opts=opts, ulfm_opts=ulfm_opts)
             work.wait()
@@ -755,12 +801,32 @@ class StepTxnOrchestrator:
                 else contextlib.nullcontext()
             )
             with ctx:
-                self.handle_work_completion(work, bucket_index=bucket_index)
+                success = self.handle_work_completion(work, bucket_index=bucket_index)
 
             self.increment_hook_counter()
 
+            # FP32 scatter-back: only on success. On failure the accumulator's
+            # fp32 buffer retains locally-accumulated (correct) values.
+            if success and bucket_index in self._deferred_fp32_views:
+                fp32_views = self._deferred_fp32_views[bucket_index]
+                offset = 0
+                for view in fp32_views:
+                    view.copy_(buffer[offset : offset + view.numel()])
+                    offset += view.numel()
+
+            if not success:
+                any_failure = True
+
         self._deferred_buckets.clear()
+        # Save fp32 views before clearing — needed by blocking restore
+        # to scatter back after re-reduction.
+        if any_failure and self._deferred_fp32_views:
+            self._last_fp32_views = dict(self._deferred_fp32_views)
+        self._deferred_fp32_views.clear()
+
+        return not any_failure
 
     def clear_deferred_buckets(self) -> None:
         """Clear the deferred bucket queue (e.g. on iteration reset)."""
         self._deferred_buckets.clear()
+        self._deferred_fp32_views.clear()

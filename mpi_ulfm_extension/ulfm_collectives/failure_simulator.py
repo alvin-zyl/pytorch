@@ -144,6 +144,7 @@ class FailureSimulator:
         desired_failures: int = 1,
         total_minibatches: int = 100,
         target_ranks: Optional[Set[int]] = None,
+        excluded_ranks: Optional[Set[int]] = None,
         enabled: bool = True,
         config_path: Optional[str] = None,
         start_minibatch: int = 0,
@@ -152,6 +153,7 @@ class FailureSimulator:
         self.desired_failures = desired_failures
         self.total_minibatches = total_minibatches
         self.target_ranks = target_ranks
+        self.excluded_ranks = excluded_ranks or set()
         self.enabled = enabled
         self.start_minibatch = max(1, start_minibatch)  # minibatch 0 always skipped
 
@@ -195,11 +197,11 @@ class FailureSimulator:
             self._state.rank = rank
             self._state.world_size = world_size
 
-            # Compute number of target ranks
+            # Compute number of target ranks (excluding protected ranks)
             if self.target_ranks is not None:
-                num_target_ranks = len(self.target_ranks)
+                num_target_ranks = len(self.target_ranks - self.excluded_ranks)
             else:
-                num_target_ranks = world_size
+                num_target_ranks = world_size - len(self.excluded_ranks)
 
             # Compute probability over the effective window (after start_minibatch)
             effective_minibatches = max(1, self.total_minibatches - self.start_minibatch)
@@ -380,6 +382,8 @@ class FailureSimulator:
             if self._has_failed:
                 return
             if self.target_ranks is not None and self._state.rank not in self.target_ranks:
+                return
+            if self._state.rank in self.excluded_ranks:
                 return
             # Determine active locations; prefer config over registered
             active_weights = self._get_active_locations_with_weights()

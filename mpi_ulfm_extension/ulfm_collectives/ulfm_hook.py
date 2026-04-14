@@ -200,8 +200,82 @@ def create_ulfm_deferred_hook(ulfm_opts: ULFM.ULFMOptions = None):
         # Return pre-resolved Future with the *same* bucket buffer tensor.
         # finalize_backward's alias check (bucket_view_in.is_alias_of(bucket_view_out))
         # passes → no copy → effectively a no-op.
-        fut = torch.futures.Future()
-        fut.set_result(bucket.buffer())
-        return fut
+        _sim = get_failure_simulator()
+        ctx = _sim.may_fail_here("post-deferred-hook-firing") if _sim is not None else contextlib.nullcontext()
+        with ctx:
+            fut = torch.futures.Future()
+            fut.set_result(bucket.buffer())
+            return fut
+
+    return hook
+
+
+def create_ulfm_fp32_deferred_hook(accumulator, param_id_to_name: dict):
+    """
+    Create a deferred ULFM hook that accumulates bf16 grads into fp32 buffers.
+
+    Combines the fp32 accumulation logic from nanotron's get_fp32_accum_hook()
+    with the deferred allreduce pattern:
+      1. Converts bf16 bucket grads → fp32 in the accumulator's buffer (add_)
+      2. Builds a contiguous fp32 buffer for the bucket's parameters
+      3. Snapshots the fp32 buffer for failure recovery
+      4. Queues the fp32 buffer for deferred ULFM allreduce
+      5. Returns pre-resolved Future (bf16 bucket unchanged for DDP)
+
+    After fire_deferred_allreduces(), the reduced fp32 values are scattered
+    back to the accumulator's per-param fp32 grad views.
+
+    Args:
+        accumulator: FP32GradientAccumulator instance
+        param_id_to_name: dict mapping id(param) → param name in accumulator
+
+    Returns:
+        Callable hook compatible with DDP.register_comm_hook()
+    """
+
+    def hook(hstate: HookState, bucket: dist.GradBucket):
+        pg = hstate.pg
+        orch = hstate.orchestrator
+        bucket_index = bucket.index()
+
+        logger.debug(
+            f"[Rank {orch._rank}] FP32 deferred hook entered for bucket {bucket_index}, "
+            f"numel={bucket.buffer().numel()}, dtype={bucket.buffer().dtype}"
+        )
+
+        if getattr(pg, "is_quiesced", lambda: False)():
+            logger.warning(
+                f"[Rank {orch._rank}] Communicator quiesced — skipping bucket {bucket_index}"
+            )
+            fut = torch.futures.Future()
+            fut.set_result(bucket.buffer())
+            return fut
+
+        # 1. Accumulate bf16 grads → fp32 buffer
+        for param, grad in zip(bucket.parameters(), bucket.gradients()):
+            name = param_id_to_name[id(param)]
+            fp32_grad_buffer = accumulator.get_grad_buffer(name)
+            fp32_grad_buffer.add_(grad.view_as(fp32_grad_buffer))
+
+        # 2. Build contiguous fp32 buffer for this bucket's params
+        fp32_views = [
+            accumulator.get_grad_buffer(param_id_to_name[id(p)]).view(-1)
+            for p in bucket.parameters()
+        ]
+        fp32_bucket_buffer = torch.cat(fp32_views)
+
+        # 3. Snapshot fp32 buffer for failure recovery
+        orch.on_bucket_snapshot(fp32_bucket_buffer, bucket_index, pg)
+
+        # 4. Queue fp32 buffer + views for deferred allreduce with scatter-back
+        orch.queue_deferred_bucket_fp32(fp32_bucket_buffer, fp32_views, bucket_index)
+
+        # 5. Return pre-resolved Future (bf16 bucket unchanged for DDP)
+        _sim = get_failure_simulator()
+        ctx = _sim.may_fail_here("post-deferred-hook-firing") if _sim is not None else contextlib.nullcontext()
+        with ctx:
+            fut = torch.futures.Future()
+            fut.set_result(bucket.buffer())
+            return fut
 
     return hook
