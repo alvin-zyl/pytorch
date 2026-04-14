@@ -4,7 +4,9 @@ from setuptools import setup, find_packages
 from torch.utils import cpp_extension
 
 sources = ["src/ProcessGroupULFM.cpp", "src/ULFMLogging.cpp", "src/bindings.cpp"]
-mpi_home = "/home/ziyueliu/openmpi-5.0.8-install"
+mpi_home = os.environ.get("MPI_HOME")
+if not mpi_home:
+    raise RuntimeError("MPI_HOME environment variable is not set. Please set it to your OpenMPI (with ULFM support) install prefix.")
 torch_lib_dir = os.path.join(os.path.dirname(torch.__file__), "lib")
 
 include_dirs = [f"{os.path.dirname(os.path.abspath(__file__))}/include/", f"{mpi_home}/include"]
