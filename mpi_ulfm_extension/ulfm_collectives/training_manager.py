@@ -159,8 +159,8 @@ class ULFMTrainingManager:
             loss *= 0.0
         return loss
 
-    def _start_restore_gradients_blocking(self):
-        self.txn.restore_gradients_blocking()
+    def _start_restore_gradients_blocking(self, allow_internal_retry: bool = True):
+        self.txn.restore_gradients_blocking(allow_internal_retry=allow_internal_retry)
 
     def _on_step_committed(self):
         self.txn.after_successful_commit()

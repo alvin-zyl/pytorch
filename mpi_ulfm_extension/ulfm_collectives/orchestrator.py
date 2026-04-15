@@ -559,12 +559,39 @@ class StepTxnOrchestrator:
             f"from epoch < {current_epoch}"
         )
 
+        # All existing snapshots are stale after a policy-boundary rollback:
+        # the extended pass about to run will repopulate _snapshots with fresh
+        # entries. Clearing here prevents blocking restore (if it runs after
+        # the extended pass also fails) from re-popping these and overwriting
+        # the extended pass's contribution.
+        self._snapshots.clear()
+
         self._set_quiesce(False)
         return
 
-    def restore_gradients_blocking(self, re_reduce: bool = True) -> None:
+    def restore_gradients_blocking(
+        self,
+        re_reduce: bool = True,
+        allow_internal_retry: bool = True,
+    ) -> None:
         """
         Blocking gradient restoration before optimizer.step().
+
+        Args:
+            re_reduce: After rolling each bucket back to its snapshot, re-issue
+                a ulfm_allreduce to produce the reduced value in place.
+            allow_internal_retry: Primary gate for internal retry on re-
+                reduction failure. When True (legacy), a re-reduction failure
+                is handled by the existing boundary-aware branch: retry if not
+                at a policy boundary, return if at one. When False, any
+                re-reduction failure returns control to the caller
+                immediately, regardless of boundary state. Pass False when the
+                caller cross-synchronizes DP groups after this call (e.g. a
+                replica barrier + ULFM DP barrier that propagates the failure
+                to late-discoverer DP groups) — otherwise early-discoverer
+                ranks retry-to-success and set restore_plan=SKIP while
+                late-discoverer ranks set restore_plan=BLOCKING and re-enter
+                alone, and the next collective deadlocks (MPI has no timeout).
         """
         current_epoch = self.dp_pg.worldEpoch()
 
@@ -607,20 +634,26 @@ class StepTxnOrchestrator:
                     work=work,
                     bucket_index=bucket_idx,
                 )
+
                 if not succeed:
-                    logger.warning(
-                        f"[Rank {self._rank}] Failure during re-reduction of bucket {bucket_idx}"
-                    )
-                    # Use the unified entry point for consistency
-                    snapshots_to_restore = [
-                        (view, snap, epoch, bucket_idx)
-                        for (view, snap, epoch, bucket_idx) in self._snapshots
-                        if epoch < current_epoch
-                        and bucket_idx not in self._buckets_reduced_current_epoch
-                    ]
-                    successfully_reduced.clear()
-                    restored_count = 0
-                    continue
+                    if allow_internal_retry and not self.at_policy_boundary:
+                        logger.warning(
+                            f"[Rank {self._rank}] Failure during re-reduction of bucket {bucket_idx}, "
+                            f"not crossing policy boundary, retrying restoration and re-reduction"
+                        )
+                        snapshots_to_restore = [
+                            (view, snap, epoch, bucket_idx)
+                            for (view, snap, epoch, bucket_idx) in self._snapshots
+                            if epoch < current_epoch
+                            and bucket_idx not in self._buckets_reduced_current_epoch
+                        ]
+                        successfully_reduced.clear()
+                        restored_count = 0
+                        continue
+                    else:
+                        # Either at policy boundary (legacy early-return) or
+                        # internal retry disabled — hand control back to caller.
+                        return
                 else:
                     successfully_reduced.add(bucket_idx)
             else:

@@ -243,19 +243,23 @@ def create_ulfm_fp32_deferred_hook(accumulator, param_id_to_name: dict):
             f"numel={bucket.buffer().numel()}, dtype={bucket.buffer().dtype}"
         )
 
-        if getattr(pg, "is_quiesced", lambda: False)():
-            logger.warning(
-                f"[Rank {orch._rank}] Communicator quiesced — skipping bucket {bucket_index}"
-            )
-            fut = torch.futures.Future()
-            fut.set_result(bucket.buffer())
-            return fut
-
-        # 1. Accumulate bf16 grads → fp32 buffer
+        # 1. Accumulate bf16 grads → fp32 buffer (unconditional: local work,
+        #    must happen even if comm is quiesced so the accumulator carries
+        #    every micro's contribution)
         for param, grad in zip(bucket.parameters(), bucket.gradients()):
             name = param_id_to_name[id(param)]
             fp32_grad_buffer = accumulator.get_grad_buffer(name)
             fp32_grad_buffer.add_(grad.view_as(fp32_grad_buffer))
+
+        # If comm is quiesced we skip snapshot + queue: no allreduce will run
+        # for this bucket this step, so there is nothing to roll back to.
+        if getattr(pg, "is_quiesced", lambda: False)():
+            logger.warning(
+                f"[Rank {orch._rank}] Communicator quiesced — skipping snapshot/queue for bucket {bucket_index}"
+            )
+            fut = torch.futures.Future()
+            fut.set_result(bucket.buffer())
+            return fut
 
         # 2. Compute contiguous slice of _contiguous_fp32_grad_buffer for this bucket
         base = accumulator._contiguous_fp32_grad_buffer
