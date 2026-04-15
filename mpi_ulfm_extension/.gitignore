@@ -13,3 +13,10 @@ dist/
 
 *.code-workspace
 .vscode
+test*
+!tests/
+!tests/*
+wandb
+checkpoints
+configs
+dist*
