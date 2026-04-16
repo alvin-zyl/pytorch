@@ -301,7 +301,8 @@ def main(args):
     logger.info("Process group initialized")
     device = f"cuda:{local_rank}"
 
-    if _ULFM_AVAILABLE and not args.single_gpu:
+    if _ULFM_AVAILABLE and not args.single_gpu and args.backend == "ulfm":
+        from ulfm_collectives.hsdp_groups import replica0_ranks as _r0
         sim = FailureSimulator(
             seed=42,
             desired_failures=0,
@@ -310,6 +311,7 @@ def main(args):
             config_path=None,
             start_minibatch=args.failure_start_step,
         )
+        sim.excluded_ranks = set(_r0(shard_size))
         set_failure_simulator(sim)
         sim.initialize(rank=global_rank, world_size=world_size)
     else:
@@ -463,7 +465,7 @@ def main(args):
             transformer_layer_cls={LlamaDecoderLayer},
         )
         model = FullyShardedDataParallel(
-            model,
+            LMWrapper(model),
             sharding_strategy=ShardingStrategy.HYBRID_SHARD,
             process_group=(shard_pg, replicate_pg),
             auto_wrap_policy=wrap_policy,
@@ -559,16 +561,19 @@ def main(args):
 
     lm_criterion = lambda output, _: output.loss
 
-    if not args.single_gpu:
+    training_manager = None
+    if not args.single_gpu and args.backend == "ulfm":
         if not _ULFM_AVAILABLE:
-            raise RuntimeError("ulfm_collectives not available; cannot run distributed training without ULFM.")
-        training_manager = ULFMTrainingManager(
-            LMWrapper(model),
+            raise RuntimeError(
+                "ulfm_collectives not available; cannot run --backend ulfm without it."
+            )
+        from ulfm_collectives.hsdp_training_manager import HSDPULFMTrainingManager
+        training_manager = HSDPULFMTrainingManager(
+            fsdp_model=model,
+            replicate_pg=replicate_pg,
             grad_accum_steps=args.gradient_accumulation,
-            failure_strategy="continue",
-            enable_auto_repair=True,
             policy_type="static",
-            initial_world_size=world_size,
+            initial_world_size=hsdp_layout.num_replicas,
         )
 
     # global steps and others are defined above
@@ -615,6 +620,25 @@ def main(args):
 
         if args.single_gpu:
             loss = model(**batch).loss
+            scaled_loss = loss / args.gradient_accumulation
+            scaled_loss.backward()
+            if global_step % args.gradient_accumulation != 0:
+                continue
+            stepped = True
+            if args.grad_clipping != 0.0:
+                torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping)
+            grad_norm = sum(
+                [
+                    torch.norm(p.grad.clone().detach().cpu())
+                    for p in model.parameters()
+                    if p.grad is not None
+                ]
+            )
+            if not layer_wise_flag:
+                optimizer.step()
+                optimizer.zero_grad()
+        elif args.backend == "nccl":
+            loss = model(batch).loss
             scaled_loss = loss / args.gradient_accumulation
             scaled_loss.backward()
             if global_step % args.gradient_accumulation != 0:
