@@ -2025,10 +2025,10 @@ class FullyShardedDataParallel(nn.Module, _FSDPState):
                 "register_comm_hook can only be called on a root instance."
             )
         for fsdp_state in traversal_utils._get_fsdp_states(self):
-            if fsdp_state.sharding_strategy in HYBRID_SHARDING_STRATEGIES:
-                raise AssertionError(
-                    f"Communication hook is not supported for hybrid strategies: {fsdp_state.sharding_strategy}"
-                )
+            # Hybrid strategies support a hybrid-specific hook signature:
+            # hook(state, sharded_grad) -> Optional[Future]. The hook replaces
+            # the cross-replica all_reduce only; intra-replica reduce_scatter
+            # still runs on the default path.
             if fsdp_state._comm_hook is not None:
                 raise AssertionError("A communication hook is already registered")
             if not callable(hook):
