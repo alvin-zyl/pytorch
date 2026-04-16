@@ -268,22 +268,39 @@ def main(args):
     random.seed(args.seed)
 
     if args.backend == "ulfm":
-        mpi_rank = int(os.environ.get("OMPI_COMM_WORLD_RANK", "0"))
-        mpi_world_size = int(os.environ.get("OMPI_COMM_WORLD_SIZE", "1"))
+        # PyTorch hardcodes a Store() placeholder for the ULFM backend and ignores
+        # any store= argument. Work around: init first, then build a real TCPStore
+        # using MPI barriers for coordination, then monkey-patch _world.pg_map so
+        # subsequent new_group(backend="nccl") can exchange ncclUniqueIds.
+        import datetime
+        dist.init_process_group(backend="ulfm")
+        _rank = dist.get_rank()
+        _world_size = dist.get_world_size()
         master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
         master_port = int(os.environ.get("MASTER_PORT", "29500"))
-        store = dist.TCPStore(
-            host_name=master_addr,
-            port=master_port,
-            world_size=mpi_world_size,
-            is_master=(mpi_rank == 0),
-        )
-        dist.init_process_group(
-            backend="ulfm",
-            store=store,
-            rank=mpi_rank,
-            world_size=mpi_world_size,
-        )
+        if _rank == 0:
+            store = dist.TCPStore(
+                host_name=master_addr,
+                port=master_port,
+                world_size=_world_size,
+                is_master=True,
+                timeout=dist.default_pg_timeout,
+                wait_for_workers=False,
+            )
+        dist.barrier()
+        if _rank != 0:
+            store = dist.TCPStore(
+                host_name=master_addr,
+                port=master_port,
+                world_size=_world_size,
+                is_master=False,
+                timeout=dist.default_pg_timeout,
+            )
+        dist.barrier()
+        import torch.distributed.distributed_c10d as _c10d
+        _default_pg = _c10d._get_default_group()
+        _backend_str, _ = _c10d._world.pg_map[_default_pg]
+        _c10d._world.pg_map[_default_pg] = (_backend_str, store)
     else:
         dist.init_process_group(backend=args.backend)
 
