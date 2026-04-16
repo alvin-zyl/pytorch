@@ -35,8 +35,10 @@ try:
     from ulfm_collectives.hsdp_groups import (
         compute_hsdp_layout,
         replica_ranks,
+        replica0_ranks,
         replicate_peer_ranks,
     )
+    from ulfm_collectives.hsdp_training_manager import HSDPULFMTrainingManager
     _ULFM_AVAILABLE = True
 except ImportError:
     _ULFM_AVAILABLE = False
@@ -302,7 +304,6 @@ def main(args):
     device = f"cuda:{local_rank}"
 
     if _ULFM_AVAILABLE and not args.single_gpu and args.backend == "ulfm":
-        from ulfm_collectives.hsdp_groups import replica0_ranks as _r0
         sim = FailureSimulator(
             seed=42,
             desired_failures=0,
@@ -311,7 +312,7 @@ def main(args):
             config_path=None,
             start_minibatch=args.failure_start_step,
         )
-        sim.excluded_ranks = set(_r0(shard_size))
+        sim.excluded_ranks = set(replica0_ranks(shard_size))
         set_failure_simulator(sim)
         sim.initialize(rank=global_rank, world_size=world_size)
     else:
@@ -567,7 +568,6 @@ def main(args):
             raise RuntimeError(
                 "ulfm_collectives not available; cannot run --backend ulfm without it."
             )
-        from ulfm_collectives.hsdp_training_manager import HSDPULFMTrainingManager
         training_manager = HSDPULFMTrainingManager(
             fsdp_model=model,
             replicate_pg=replicate_pg,
