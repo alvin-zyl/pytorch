@@ -237,11 +237,18 @@ def build_hsdp_groups(world_size: int, shard_size: int, backend: str):
     layout = compute_hsdp_layout(world_size=world_size, shard_size=shard_size)
     my_rank = dist.get_rank()
 
+    _timeout_sec = os.getenv("NCCL_PG_TIMEOUT_SECONDS")
+    _nccl_timeout = (
+        datetime.timedelta(seconds=float(_timeout_sec))
+        if _timeout_sec is not None
+        else None
+    )
+
     # --- Shard groups: one per replica ---
     shard_pg = None
     for rid in range(layout.num_replicas):
         ranks = replica_ranks(rid, shard_size)
-        pg = dist.new_group(ranks=ranks, backend="nccl")
+        pg = dist.new_group(ranks=ranks, backend="nccl", timeout=_nccl_timeout)
         if my_rank in ranks:
             shard_pg = pg
 
@@ -254,7 +261,7 @@ def build_hsdp_groups(world_size: int, shard_size: int, backend: str):
         if backend == "ulfm":
             pg = dist.new_group(ranks=ranks, backend=None)
         else:
-            pg = dist.new_group(ranks=ranks, backend="nccl")
+            pg = dist.new_group(ranks=ranks, backend="nccl", timeout=_nccl_timeout)
         if my_rank in ranks:
             replicate_pg = pg
 
@@ -276,7 +283,7 @@ def main(args):
         dist.init_process_group(backend="ulfm")
         _rank = dist.get_rank()
         _world_size = dist.get_world_size()
-        master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
+        master_addr = os.environ.get("MASTER_ADDR", "localhost")
         master_port = int(os.environ.get("MASTER_PORT", "29500"))
         if _rank == 0:
             store = dist.TCPStore(
