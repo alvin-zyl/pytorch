@@ -28,6 +28,11 @@ try:
     import ulfm_collectives as ULFM
     from ulfm_collectives.training_manager import ULFMTrainingManager
     from ulfm_collectives.failure_simulator import FailureSimulator, set_failure_simulator
+    from ulfm_collectives.hsdp_groups import (
+        compute_hsdp_layout,
+        replica_ranks,
+        replicate_peer_ranks,
+    )
     _ULFM_AVAILABLE = True
 except ImportError:
     _ULFM_AVAILABLE = False
@@ -216,12 +221,47 @@ def evaluate_model(
 
     return total_loss, evaluated_on_tokens
 
+def build_hsdp_groups(world_size: int, shard_size: int, backend: str):
+    """Build (shard_pg, replicate_pg, layout) for the current rank.
+
+    shard_pg is always NCCL. replicate_pg matches `backend`
+    ('nccl' or 'ulfm'). Every group is created on every rank (required by
+    PyTorch dist.new_group), but each rank only belongs to one of each kind.
+    """
+    layout = compute_hsdp_layout(world_size=world_size, shard_size=shard_size)
+    my_rank = dist.get_rank()
+
+    # --- Shard groups: one per replica ---
+    shard_pg = None
+    for rid in range(layout.num_replicas):
+        ranks = replica_ranks(rid, shard_size)
+        pg = dist.new_group(ranks=ranks, backend="nccl")
+        if my_rank in ranks:
+            shard_pg = pg
+
+    # --- Replicate groups: one per intra-replica offset ---
+    replicate_pg = None
+    for offset in range(shard_size):
+        ranks = replicate_peer_ranks(offset, shard_size, layout.num_replicas)
+        # backend=None on the ULFM side inherits the world backend (ulfm);
+        # backend='nccl' on the baseline side forces NCCL explicitly.
+        if backend == "ulfm":
+            pg = dist.new_group(ranks=ranks, backend=None)
+        else:
+            pg = dist.new_group(ranks=ranks, backend="nccl")
+        if my_rank in ranks:
+            replicate_pg = pg
+
+    assert shard_pg is not None and replicate_pg is not None
+    return shard_pg, replicate_pg, layout
+
+
 def main(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    dist.init_process_group(backend="ulfm")
+    dist.init_process_group(backend=args.backend)
 
     # assert "LOCAL_RANK" in os.environ, "torchrun should set LOCAL_RANK"
     # global_rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID")))
@@ -233,6 +273,22 @@ def main(args):
     local_rank = int(os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK",
                                     str(global_rank % max(torch.cuda.device_count(), 1))))
     torch.cuda.set_device(local_rank)
+
+    if not args.single_gpu:
+        if args.hsdp_shard_size is None:
+            shard_size = max(torch.cuda.device_count(), 1)
+        else:
+            shard_size = args.hsdp_shard_size
+        shard_pg, replicate_pg, hsdp_layout = build_hsdp_groups(
+            world_size=world_size, shard_size=shard_size, backend=args.backend
+        )
+        logger.info(
+            f"HSDP layout: num_replicas={hsdp_layout.num_replicas}, "
+            f"shard_size={shard_size}, my replica={hsdp_layout.replica_id_of(global_rank)}, "
+            f"my shard_rank={hsdp_layout.shard_rank_of(global_rank)}"
+        )
+    else:
+        shard_pg = replicate_pg = hsdp_layout = None
 
     logger.info(
         f"Global rank {global_rank}, local rank {local_rank}, device: {torch.cuda.current_device()}"
