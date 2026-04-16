@@ -295,3 +295,87 @@ def create_ulfm_fp32_deferred_hook(accumulator, param_id_to_name: dict):
             return fut
 
     return hook
+
+
+@dataclass
+class HSDPHookState:
+    """State for the FSDP1 HYBRID_SHARD ULFM hook.
+
+    Unlike DDP, FSDP fires the hook per FSDP unit (not per bucket). We assign
+    a stable unit index in registration order — FSDP unit order is
+    deterministic across ranks, so every rank sees the same indices.
+    """
+
+    pg: "Union[ULFM.ProcessGroupULFM, dist.ProcessGroup]"
+    orchestrator: StepTxnOrchestrator
+    _unit_counter: int = 0
+
+    def next_unit_index(self) -> int:
+        idx = self._unit_counter
+        self._unit_counter += 1
+        return idx
+
+    def reset_unit_counter(self) -> None:
+        """Call between training steps so unit indices restart at 0."""
+        self._unit_counter = 0
+
+
+def create_ulfm_hsdp_hook(ulfm_opts: ULFM.ULFMOptions = None):
+    """
+    Create an FSDP1 HYBRID_SHARD ULFM comm hook.
+
+    FSDP fires this after the intra-replica reduce-scatter. The hook's job
+    is to perform the cross-replica allreduce on the shard grad. On failure,
+    the orchestrator snapshots and restores the bf16 shard grad in place.
+
+    Hook signature per FSDP1: (state, grad_shard: torch.Tensor) -> Future[Tensor].
+
+    Up/down-casting to fp32 for MPI happens inside the C++ ulfm_allreduce;
+    Python-side stays in bf16.
+
+    Returns:
+        Callable hook compatible with FullyShardedDataParallel.register_comm_hook()
+    """
+    opts = torch.distributed.AllreduceOptions()
+    opts.reduceOp = torch.distributed.ReduceOp.SUM
+    ulfm_opts = ulfm_opts if ulfm_opts is not None else ULFM.ULFMOptions()
+
+    def hook(state: HSDPHookState, grad_shard: torch.Tensor):
+        pg = state.pg
+        orch = state.orchestrator
+        unit_index = state.next_unit_index()
+
+        logger.debug(
+            f"[Rank {orch._rank}] HSDP hook entered for unit {unit_index}, "
+            f"numel={grad_shard.numel()}, dtype={grad_shard.dtype}"
+        )
+
+        # 1) Quiesced? NOOP.
+        if getattr(pg, "is_quiesced", lambda: False)():
+            logger.warning(
+                f"[Rank {orch._rank}] replicate_pg quiesced — skipping unit {unit_index}."
+            )
+            fut = torch.futures.Future()
+            fut.set_result(grad_shard)
+            return fut
+
+        # 2) Sync GPU work before entering MPI (same rationale as DDP hook).
+        torch.cuda.synchronize()
+
+        # 3) Snapshot the bf16 shard grad for restore.
+        orch.on_bucket_snapshot(grad_shard, unit_index, pg)
+
+        # 4) Submit ulfm_allreduce on replicate_pg. up/down-cast lives in C++.
+        work = pg.ulfm_allreduce([grad_shard], opts, ulfm_opts)
+
+        def on_done(fut):
+            _sim = get_failure_simulator()
+            ctx = _sim.may_fail_here("post-allreduce") if _sim is not None else contextlib.nullcontext()
+            with ctx:
+                orch.handle_work_completion(work=work, bucket_index=unit_index)
+            orch.increment_hook_counter()
+            return fut.value()[0]
+
+        return work.get_future().then(on_done)
+
+    return hook
