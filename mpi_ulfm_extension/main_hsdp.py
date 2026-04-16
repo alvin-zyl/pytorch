@@ -267,7 +267,25 @@ def main(args):
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    dist.init_process_group(backend=args.backend)
+    if args.backend == "ulfm":
+        mpi_rank = int(os.environ.get("OMPI_COMM_WORLD_RANK", "0"))
+        mpi_world_size = int(os.environ.get("OMPI_COMM_WORLD_SIZE", "1"))
+        master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
+        master_port = int(os.environ.get("MASTER_PORT", "29500"))
+        store = dist.TCPStore(
+            host_name=master_addr,
+            port=master_port,
+            world_size=mpi_world_size,
+            is_master=(mpi_rank == 0),
+        )
+        dist.init_process_group(
+            backend="ulfm",
+            store=store,
+            rank=mpi_rank,
+            world_size=mpi_world_size,
+        )
+    else:
+        dist.init_process_group(backend=args.backend)
 
     # assert "LOCAL_RANK" in os.environ, "torchrun should set LOCAL_RANK"
     # global_rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID")))
@@ -308,7 +326,7 @@ def main(args):
             seed=42,
             desired_failures=0,
             total_minibatches=100 * args.gradient_accumulation,
-            target_ranks={},
+            target_ranks=None,
             config_path=None,
             start_minibatch=args.failure_start_step,
         )
@@ -361,7 +379,7 @@ def main(args):
 
     if args.offline_mode:
         logger.info("Loading tokenized data from disk")
-        data = datasets.load_from_disk("/eagle/TensorCompress/alvinliu/datasets/c4/tokenized")
+        data = datasets.load_from_disk("/data/ziyueliu/datasets/c4/tokenized")
         logger.info("Finished loading from disk")
     else:
         data = datasets.load_dataset("allenai/c4", "en", split="train", streaming=True)
