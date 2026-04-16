@@ -844,6 +844,34 @@ def _reduce_grad(state: _FSDPState, handle: FlatParamHandle) -> None:
     padded_unsharded_grad, new_sharded_grad = _get_reduce_scatter_tensors(
         state, unsharded_grad
     )
+    if uses_hybrid_sharded_strategy and state._comm_hook is not None:
+        # Hybrid-with-hook path: default reduce_scatter intra-replica, then the
+        # registered hook replaces the cross-replica all_reduce. The hook
+        # signature is hook(state, sharded_grad) -> Optional[Future].
+        _div_if_needed(padded_unsharded_grad, state._gradient_predivide_factor)
+        pg = (
+            handle._fake_process_group
+            if handle._use_fake_reduce
+            else state.process_group
+        )
+        dist.reduce_scatter_tensor(
+            new_sharded_grad,
+            padded_unsharded_grad,
+            group=pg,
+        )
+        if not torch.distributed._functional_collectives.is_torchdynamo_compiling():
+            state._all_reduce_stream.wait_stream(state._post_backward_stream)
+        with state._device_handle.stream(state._all_reduce_stream):
+            _no_dispatch_record_stream(new_sharded_grad, state._all_reduce_stream)
+            fut = state._comm_hook(state._comm_hook_state, new_sharded_grad)
+            if fut is not None:
+                fut.wait()
+            _div_if_needed(new_sharded_grad, state._gradient_postdivide_factor)
+            grad_to_offload = _accumulate_sharded_grad(
+                state, handle, new_sharded_grad
+            )
+            _post_reduce_grad_callback(state, handle, grad_to_offload)
+            return
     if state._comm_hook is None:  # default path
         _div_if_needed(padded_unsharded_grad, state._gradient_predivide_factor)
         pg = (
@@ -877,7 +905,6 @@ def _reduce_grad(state: _FSDPState, handle: FlatParamHandle) -> None:
         state._comm_hook(
             state._comm_hook_state, padded_unsharded_grad, new_sharded_grad
         )
-        # NOTE: HSDP variants do not support communication hook.
     grad_to_offload = _accumulate_sharded_grad(state, handle, new_sharded_grad)
     _post_reduce_grad_callback(state, handle, grad_to_offload)
 
