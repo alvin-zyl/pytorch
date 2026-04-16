@@ -430,8 +430,11 @@ ProcessGroupULFM::ProcessGroupULFM(int rank, int size, MPI_Comm pgComm)
 
   // Initialize num_major_procs_ to world size (all ranks start as major workers)
   num_major_procs_.store(size, std::memory_order_release);
+  
+  char hostname[256];
+  gethostname(hostname, sizeof(hostname));
 
-  ULFM_LOG_WARN(rank, "ULFM MPI Constructor initialized with rank " << rank << ", size " << size);
+  ULFM_LOG_WARN(rank, "ULFM MPI Constructor initialized with rank " << rank << ", size " << size << ", on host " << hostname);
 
   // Start the worker thread accepting MPI calls
   workerThread_ = std::thread(&ProcessGroupULFM::runLoop, this);

@@ -603,7 +603,7 @@ class StepTxnOrchestrator:
         ]
 
         if not snapshots_to_restore:
-            logger.debug(
+            logger.info(
                 f"[Rank {self._rank}] No snapshots need restoration - all buckets are up to date"
             )
             self._need_restore.clear()
