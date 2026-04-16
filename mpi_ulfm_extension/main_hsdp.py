@@ -6,10 +6,15 @@ import random
 import argparse
 import numpy as np
 
+import functools
+
 import torch
 import torch.nn as nn
 import torch.utils.data
 import torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel, ShardingStrategy
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
 import transformers
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
@@ -451,7 +456,22 @@ def main(args):
             model = model.to(device=device)
 
     if args.activation_checkpointing:
-        model.gradient_checkpointing_enable()        
+        model.gradient_checkpointing_enable()
+
+    if not args.single_gpu:
+        wrap_policy = functools.partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={LlamaDecoderLayer},
+        )
+        model = FullyShardedDataParallel(
+            model,
+            sharding_strategy=ShardingStrategy.HYBRID_SHARD,
+            process_group=(shard_pg, replicate_pg),
+            auto_wrap_policy=wrap_policy,
+            device_id=local_rank,
+            use_orig_params=True,
+            mixed_precision=None,
+        )
 
     global_step = 0
     update_step = 0
