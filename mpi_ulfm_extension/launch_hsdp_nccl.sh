@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=2,3,4,5 torchrun --standalone --nproc-per-node=4 --master-port=21032 main_hsdp.py --backend nccl --hsdp_shard_size 2 --model_config configs/llama60m.json --batch_size 64 --total_batch_size 512 --num_training_steps 10000 --warmup_steps 1000 --weight_decay 0.1 --grad_clipping 1.0 --dtype bfloat16 --offline
