@@ -1261,9 +1261,7 @@ c10::intrusive_ptr<Work> ProcessGroupULFM::barrier(const BarrierOptions& opts) {
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
       [this](std::unique_ptr<WorkEntry>& entry) {
         std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
-        ULFM_LOG_WARN(currentRank_, "Entering barrier");
         MPI_CHECK(MPI_Barrier(pgComm_));
-        ULFM_LOG_WARN(currentRank_, "Leaving barrier");
       };
   auto entry =
       std::make_unique<WorkEntry>(nullptr, nullptr, std::move(runFunc));
