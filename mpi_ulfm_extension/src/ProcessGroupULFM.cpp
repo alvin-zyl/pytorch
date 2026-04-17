@@ -1728,11 +1728,12 @@ void ProcessGroupULFM::compute_failed_counts(
 bool ProcessGroupULFM::check_at_policy_boundary(
     const FailureStats& failure_stats,
     const RankTypeCounts& current_counts) {
-  // At policy boundary if:
-  // - Major worker failed but no major spares available to replace
-  // - OR minor worker failed but no minor spares available to replace
-  return (failure_stats.failed_majors > 0 && current_counts.major_spares == 0) ||
-         (failure_stats.failed_minors > 0 && current_counts.minor_spares == 0);
+  // At policy boundary if surviving spares cannot cover every failed slot.
+  // current_counts is taken among survivors pre-promotion, so major_spares /
+  // minor_spares is the number of spares available to fill gaps. Boundary
+  // when failed_majors exceeds available major spares (or the same for minors).
+  return (failure_stats.failed_majors > current_counts.major_spares) ||
+         (failure_stats.failed_minors > current_counts.minor_spares);
 }
 
 void ProcessGroupULFM::update_policy_boundary(bool event_boundary) {
