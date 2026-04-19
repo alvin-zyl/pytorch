@@ -846,8 +846,10 @@ def _reduce_grad(state: _FSDPState, handle: FlatParamHandle) -> None:
     )
     if uses_hybrid_sharded_strategy and state._comm_hook is not None:
         # Hybrid-with-hook path: default reduce_scatter intra-replica, then the
-        # registered hook replaces the cross-replica all_reduce. The hook
-        # signature is hook(state, sharded_grad) -> Optional[Future].
+        # registered hook replaces the cross-replica all_reduce. The hook's
+        # returned future, postdivide, _accumulate_sharded_grad, and
+        # _post_reduce_grad_callback are deferred to _post_backward_final_callback
+        # so that MPI-backed hooks (e.g. ULFM) don't block the autograd thread.
         _div_if_needed(padded_unsharded_grad, state._gradient_predivide_factor)
         pg = (
             handle._fake_process_group
@@ -864,14 +866,12 @@ def _reduce_grad(state: _FSDPState, handle: FlatParamHandle) -> None:
         with state._device_handle.stream(state._all_reduce_stream):
             _no_dispatch_record_stream(new_sharded_grad, state._all_reduce_stream)
             fut = state._comm_hook(state._comm_hook_state, new_sharded_grad)
-            if fut is not None:
-                fut.wait()
-            _div_if_needed(new_sharded_grad, state._gradient_postdivide_factor)
-            grad_to_offload = _accumulate_sharded_grad(
-                state, handle, new_sharded_grad
-            )
-            _post_reduce_grad_callback(state, handle, grad_to_offload)
-            return
+        pending = getattr(state, "_pending_cross_replica", None)
+        if pending is None:
+            pending = []
+            state._pending_cross_replica = pending
+        pending.append((fut, handle, new_sharded_grad))
+        return
     if state._comm_hook is None:  # default path
         _div_if_needed(padded_unsharded_grad, state._gradient_predivide_factor)
         pg = (
@@ -1118,6 +1118,24 @@ def _post_backward_final_callback(
         "The post-backward callback should only be called on the root FSDP instance",
     )
     root_state = state
+
+    # Drain cross-replica allreduces deferred by the hybrid-with-hook path in
+    # _reduce_grad. Must run before _finalize_params reads _saved_grad_shard and
+    # before the current_stream.wait_stream(_all_reduce_stream) below picks up
+    # the CUDA ops queued here.
+    for fsdp_state in state._all_fsdp_states:
+        pending = getattr(fsdp_state, "_pending_cross_replica", None)
+        if pending:
+            with fsdp_state._device_handle.stream(fsdp_state._all_reduce_stream):
+                for fut, handle, new_sharded_grad in pending:
+                    if fut is not None:
+                        fut.wait()
+                    _div_if_needed(new_sharded_grad, fsdp_state._gradient_postdivide_factor)
+                    grad_to_offload = _accumulate_sharded_grad(
+                        fsdp_state, handle, new_sharded_grad
+                    )
+                    _post_reduce_grad_callback(fsdp_state, handle, grad_to_offload)
+            pending.clear()
 
     if root_state._sync_gradients:
         current_stream = state._device_handle.current_stream()

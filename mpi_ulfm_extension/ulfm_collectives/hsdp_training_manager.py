@@ -37,6 +37,7 @@ class HSDPULFMTrainingManager(ULFMTrainingManager):
         self,
         fsdp_model,
         replicate_pg,
+        world_pg: ULFM.ProcessGroupULFM = None,
         grad_accum_steps: int = 1,
         policy_type: str = "static",
         **policy_kwargs,
@@ -48,6 +49,7 @@ class HSDPULFMTrainingManager(ULFMTrainingManager):
 
         self.failure_strategy = "continue"
         self.process_group = replicate_pg
+        self.world_pg = world_pg if world_pg is not None else dist.group.WORLD
 
         policy = create_policy(
             policy_type=policy_type,
@@ -91,4 +93,7 @@ class HSDPULFMTrainingManager(ULFMTrainingManager):
     def train_step(self, *args, **kwargs):
         """Reset per-step unit counter, then delegate to the parent."""
         self._hook_state.reset_unit_counter()
+        ulfm_opts = ULFM.ULFMOptions(auto_repair=True)
+        work = self.world_pg.consensus(ulfm_opts)
+        work.wait()
         return super().train_step(*args, **kwargs)
