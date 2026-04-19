@@ -351,6 +351,7 @@ class StepTxnOrchestrator:
                     curr_minor_spares,
                     curr_boundary_minors,
                     curr_contributed,
+                    curr_boundary_contributed,
                 ) = work.get_current_counts()
 
                 failure_event = FailureEvent(
@@ -371,6 +372,7 @@ class StepTxnOrchestrator:
                     curr_num_minor_spares=curr_minor_spares,
                     curr_num_boundary_minor_procs=curr_boundary_minors,
                     curr_contributed=curr_contributed,
+                    curr_boundary_contributed=curr_boundary_contributed,
                     at_policy_boundary=at_policy_boundary,
                 )
 
@@ -441,9 +443,15 @@ class StepTxnOrchestrator:
         self.detect_policy_boundary(decision.at_policy_boundary)
         if self.at_policy_boundary:
             self._num_policy_boundary_steps = decision.num_policy_boundary_steps or 0
+            # Fold any contributions already made during a prior boundary
+            # extended pass into the regular counter (no-op if this is a
+            # fresh boundary) before installing the new split, so the next
+            # extension stacks cleanly on top.
+            self.dp_pg.merge_boundary_contributed()
             self.dp_pg.set_boundary_minor_split(
                 decision.num_nonzero_grad_procs,
                 decision.num_policy_boundary_steps,
+                decision.num_policy_boundary_steps - 1,
             )
 
         if restore_mode != GradRestoreMode.SKIP:
@@ -711,6 +719,7 @@ class StepTxnOrchestrator:
         self.dp_pg.set_major_minor_split_with_spares(*rank_type_counts)
         self.dp_pg.update_rank_type_counts(*rank_type_counts)
         self.dp_pg.reset_policy_boundary()
+        self.dp_pg.reset_boundary_minor()
         self.dp_pg.set_target_contribution(
             self.curr_grad_accum_steps, self.minor_proc_grad_accum_steps
         )

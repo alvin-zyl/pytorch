@@ -64,12 +64,14 @@ class WorkULFM(Work):
         """
         ...
 
-    def get_current_counts(self) -> Tuple[int, int, int, int, int, int]:
+    def get_current_counts(self) -> Tuple[int, int, int, int, int, int, int]:
         """Get current rank type counts as tuple.
 
         Returns:
-            (majors, minors, major_spares, minor_spares, boundary_minors, contributed)
-            where contributed is the global sum of gradient contributions across all
+            (majors, minors, major_spares, minor_spares, boundary_minors,
+             contributed, boundary_contributed)
+            where contributed / boundary_contributed are the global sums of
+            regular-phase and boundary-phase gradient contributions across all
             surviving ranks at the time count_rank_types was called.
         """
         ...
@@ -210,15 +212,25 @@ class ProcessGroupULFM(ProcessGroup):
         """Check if this rank is a boundary minor rank."""
         ...
 
-    def set_boundary_minor_split(self, num_boundary_majors: int, workload: int) -> None:
-        """Set the boundary minor split and target contributions.
+    def set_boundary_minor_split(
+        self,
+        num_boundary_majors: int,
+        boundary_major_workload: int,
+        boundary_minor_workload: int,
+    ) -> None:
+        """Set the boundary minor split and directly populate the boundary-phase
+        target contribution for this rank.
 
-        Ranks < num_boundary_majors are non-boundary: their target_contribution
-        is incremented by workload.
-        Ranks >= num_boundary_majors are boundary minors: their target_contribution
-        is incremented workload - 1.
+        Ranks < num_boundary_majors are not boundary minor; their
+        boundary_target_contribution is set to boundary_major_workload.
+        Ranks >= num_boundary_majors are boundary minor; their
+        boundary_target_contribution is set to boundary_minor_workload.
 
-        Raises if workload <= 0.
+        boundary_contributed_ is reset by reset_contributed() at iteration
+        end, so this is safe to call multiple times within the same boundary
+        (e.g. after cascading failures).
+
+        Raises if either workload is negative.
         """
         ...
 
@@ -304,10 +316,42 @@ class ProcessGroupULFM(ProcessGroup):
         """
         ...
 
-    def should_contribute(self) -> bool:
-        """Return True if this rank has not yet reached its target contribution.
+    def get_boundary_contributed(self) -> int:
+        """Get local count of gradient contributions made during the boundary phase."""
+        ...
 
-        Equivalent to: contributed < target_contribution.
+    def reset_boundary_contributed(self) -> None:
+        """Reset the boundary-phase gradient contribution counter to zero."""
+        ...
+
+    def merge_boundary_contributed(self) -> None:
+        """Fold boundary_contributed into contributed and zero both
+        boundary_contributed and boundary_target_contribution.
+
+        Call before issuing a new set_boundary_minor_split at a nested
+        boundary so the contributions already made during the previous
+        extended pass are accounted for by the regular counter and the
+        next extension stacks on top cleanly.
+        """
+        ...
+
+    def get_boundary_target_contribution(self) -> int:
+        """Get the boundary-phase target contribution value for this rank."""
+        ...
+
+    def set_boundary_target_contribution(self, value: int) -> None:
+        """Set the boundary-phase target contribution (non-negative).
+
+        Raises if value < 0.
+        """
+        ...
+
+    def should_contribute(self) -> bool:
+        """Return True if this rank still owes a contribution.
+
+        During the extended pass at a policy boundary (is_at_policy_boundary()
+        is True) compares boundary_contributed < boundary_target_contribution;
+        otherwise compares contributed < target_contribution.
         """
         ...
 

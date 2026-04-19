@@ -1692,18 +1692,23 @@ void ProcessGroupULFM::count_rank_types(RankTypeCounts& counts) {
   counts.minor_spares = data[3];
   counts.boundary_minors = data[4];
 
-  // Reduce local contribution counts globally (SUM) without modifying contributed_.
-  // This gives the global total of gradient contributions across all surviving ranks.
-  int64_t contrib = contributed_.load(std::memory_order_acquire);
-  MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, &contrib, 1, MPI_INT64_T, MPI_SUM, pgComm_));
-  counts.contributed = contrib;
+  // Reduce local contribution counts globally (SUM) without modifying the
+  // per-rank atomics. Coalesced into a single Allreduce for both phases.
+  int64_t contrib_buf[2] = {
+      contributed_.load(std::memory_order_acquire),
+      boundary_contributed_.load(std::memory_order_acquire),
+  };
+  MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, contrib_buf, 2, MPI_INT64_T, MPI_SUM, pgComm_));
+  counts.contributed = contrib_buf[0];
+  counts.boundary_contributed = contrib_buf[1];
 
   ULFM_LOG_DEBUG(currentRank_, "count_rank_types: majors=" << counts.majors
                  << " minors=" << counts.minors
                  << " major_spares=" << counts.major_spares
                  << " minor_spares=" << counts.minor_spares
                  << " boundary_minors=" << counts.boundary_minors
-                 << " contributed(global)=" << counts.contributed);
+                 << " contributed(global)=" << counts.contributed
+                 << " boundary_contributed(global)=" << counts.boundary_contributed);
 }
 
 void ProcessGroupULFM::compute_failed_counts(
@@ -1901,18 +1906,28 @@ void ProcessGroupULFM::reset_boundary_minor() {
   }
 }
 
-void ProcessGroupULFM::set_boundary_minor_split(int num_boundary_majors, int64_t workload) {
-  TORCH_CHECK(workload > 0, "workload must be positive");
-  // Ranks < num_boundary_majors are not boundary minor
-  // Ranks >= num_boundary_majors are boundary minor
+void ProcessGroupULFM::set_boundary_minor_split(int num_boundary_majors,
+                                                int64_t boundary_major_workload,
+                                                int64_t boundary_minor_workload) {
+  TORCH_CHECK(boundary_major_workload >= 0,
+              "boundary_major_workload must be non-negative");
+  TORCH_CHECK(boundary_minor_workload >= 0,
+              "boundary_minor_workload must be non-negative");
+  // Ranks <  num_boundary_majors are not boundary minor -> boundary_major_workload
+  // Ranks >= num_boundary_majors are boundary minor     -> boundary_minor_workload
+  // During the extended pass (is_at_policy_boundary() == true) all ranks
+  // route their contribution increments into boundary_contributed_ and
+  // check against boundary_target_contribution_. boundary_contributed_ is
+  // reset by reset_contributed() at iteration end, so this call is safe to
+  // invoke multiple times within the same boundary.
   if (currentRank_ >= num_boundary_majors) {
     set_boundary_minor();
-    // Boundary minors carry one fewer unit of work
-    increment_target_contribution(workload - 1);
+    boundary_target_contribution_.store(boundary_minor_workload,
+                                        std::memory_order_release);
   } else {
     reset_boundary_minor();
-    // Non-boundary ranks carry the full workload
-    increment_target_contribution(workload);
+    boundary_target_contribution_.store(boundary_major_workload,
+                                        std::memory_order_release);
   }
 }
 

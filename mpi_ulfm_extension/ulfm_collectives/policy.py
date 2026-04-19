@@ -98,6 +98,7 @@ class FailureEvent:
     curr_num_boundary_minor_procs: Optional[int] = (
         None  # Current number of boundary minor processes
     )
+    curr_boundary_contributed: int = 0  # Global sum of boundary-phase gradient contributions
 
 
 class FaultTolerancePolicy:
@@ -352,6 +353,12 @@ class StaticWorldPolicy(FaultTolerancePolicy):
         ), f"target_world_size ({self.target_world_size}) cannot exceed initial_world_size ({initial_world_size})"
 
         self._initial_grad_accum_steps = initial_grad_accum_steps
+        # Reference baseline used by _on_policy_boundary as the starting point
+        # for the next extension. Defaults to self.grad_accum_steps; promoted
+        # to self._current_grad_accum_steps only when a failure is observed
+        # during an active boundary extended pass (boundary_contributed > 0),
+        # so stacked boundaries extend on top of the already-extended window.
+        self._boundary_ref_grad_accum_steps = initial_grad_accum_steps
         self._current_grad_accum_steps = (
             initial_grad_accum_steps  # subject to change at policy boundaries
         )
@@ -428,6 +435,17 @@ class StaticWorldPolicy(FaultTolerancePolicy):
         """
         Handle actions needed when at a policy boundary.
         """
+        # If this failure was observed during an active boundary extended
+        # pass, fold the boundary-phase contributions into curr_contributed
+        # and use the already-extended _current_grad_accum_steps as the new
+        # reference baseline. Otherwise start from the regular grad_accum_steps.
+        if failure_event.curr_boundary_contributed > 0:
+            failure_event.curr_contributed += failure_event.curr_boundary_contributed
+            failure_event.curr_boundary_contributed = 0
+            self._boundary_ref_grad_accum_steps = self._current_grad_accum_steps
+        else:
+            self._boundary_ref_grad_accum_steps = self.grad_accum_steps
+
         target_world_size_with_acc = (
             self.target_world_size * self._initial_grad_accum_steps
         )
@@ -440,7 +458,7 @@ class StaticWorldPolicy(FaultTolerancePolicy):
             num_policy_boundary_steps += 1
 
         self._current_grad_accum_steps = (
-            self.grad_accum_steps + num_policy_boundary_steps
+            self._boundary_ref_grad_accum_steps + num_policy_boundary_steps
         )
 
         num_zero_grad_procs = (
@@ -452,7 +470,7 @@ class StaticWorldPolicy(FaultTolerancePolicy):
             f"[StaticWorldPolicy] At policy boundary: current world size {failure_event.curr_size}, "
             f"target batch size {target_world_size_with_acc}, current gradients (global) on hand: {failure_event.curr_contributed}, "
             f"temporarily adjusting grad_accum_steps by {num_policy_boundary_steps}: "
-            f"{self.grad_accum_steps} -> {self._current_grad_accum_steps}. "
+            f"{self._boundary_ref_grad_accum_steps} -> {self._current_grad_accum_steps}. "
             f"Number of zero-grad procs at the last boundary step: {num_zero_grad_procs}."
         )
         num_nonzero_grad_procs = failure_event.curr_size - num_zero_grad_procs

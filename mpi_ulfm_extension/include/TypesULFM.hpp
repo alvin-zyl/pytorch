@@ -9,7 +9,8 @@ struct RankTypeCounts {
   int major_spares = 0;
   int minor_spares = 0;
   int boundary_minors = 0;
-  int64_t contributed = 0;  // Global sum of gradient contributions (filled by count_rank_types)
+  int64_t contributed = 0;           // Global sum of regular-phase gradient contributions
+  int64_t boundary_contributed = 0;  // Global sum of boundary-phase gradient contributions
 
   RankTypeCounts() = default;
   RankTypeCounts(int m, int n, int ms, int ns, int bm = 0)

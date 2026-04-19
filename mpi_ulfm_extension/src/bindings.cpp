@@ -90,10 +90,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("is_boundary_minor", &c10d::ProcessGroupULFM::is_boundary_minor,
          "Check if this rank is a boundary minor rank")
       .def("set_boundary_minor_split", &c10d::ProcessGroupULFM::set_boundary_minor_split,
-         py::arg("num_boundary_majors"), py::arg("workload"),
-         "Set the boundary minor split and target contributions. "
-         "Non-boundary ranks increment target_contribution by workload; "
-         "boundary minor ranks set target_contribution to workload - 1.")
+         py::arg("num_boundary_majors"),
+         py::arg("boundary_major_workload"),
+         py::arg("boundary_minor_workload"),
+         "Set the boundary minor split and directly populate the boundary-phase "
+         "target contribution: ranks < num_boundary_majors take boundary_major_workload, "
+         "ranks >= num_boundary_majors take boundary_minor_workload. "
+         "boundary_contributed_ is cleared by reset_contributed() at iteration end, "
+         "so this is safe to call multiple times within the same boundary.")
       .def("is_at_policy_boundary", &c10d::ProcessGroupULFM::is_at_policy_boundary,
          "Check if PG has reached policy boundary (sticky flag)")
       .def("reset_policy_boundary", &c10d::ProcessGroupULFM::reset_policy_boundary,
@@ -134,8 +138,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("increment_target_contribution", &c10d::ProcessGroupULFM::increment_target_contribution,
          py::arg("delta") = 1,
          "Increment the target contribution by a positive delta (default 1).")
+      .def("get_boundary_contributed", &c10d::ProcessGroupULFM::get_boundary_contributed,
+         "Get local count of gradient contributions made during the boundary phase.")
+      .def("reset_boundary_contributed", &c10d::ProcessGroupULFM::reset_boundary_contributed,
+         "Reset the boundary-phase gradient contribution counter to zero.")
+      .def("merge_boundary_contributed", &c10d::ProcessGroupULFM::merge_boundary_contributed,
+         "Fold boundary_contributed into contributed and zero both "
+         "boundary_contributed and boundary_target_contribution. "
+         "Call before issuing a new set_boundary_minor_split at a nested boundary.")
+      .def("get_boundary_target_contribution", &c10d::ProcessGroupULFM::get_boundary_target_contribution,
+         "Get the boundary-phase target contribution value for this rank.")
+      .def("set_boundary_target_contribution", &c10d::ProcessGroupULFM::set_boundary_target_contribution,
+         py::arg("value"),
+         "Set the boundary-phase target contribution (non-negative).")
       .def("should_contribute", &c10d::ProcessGroupULFM::should_contribute,
-         "Return True if contributed < target_contribution.")
+         "Return True if this rank still owes a contribution. During the extended "
+         "pass at a policy boundary compares boundary_contributed < boundary_target_contribution; "
+         "otherwise compares contributed < target_contribution.")
       .def("elect_promotion", &c10d::ProcessGroupULFM::elect_promotion,
          py::arg("failed_majors"), py::arg("failed_minors"),
          "Elect spare promotion via collective. Returns True if THIS rank was promoted")
@@ -165,8 +184,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           const auto& counts = self.get_current_counts();
           return py::make_tuple(counts.majors, counts.minors,
                                 counts.major_spares, counts.minor_spares,
-                                counts.boundary_minors, counts.contributed);
-      }, "Get current rank type counts as tuple: (majors, minors, major_spares, minor_spares, boundary_minors, contributed)");
+                                counts.boundary_minors,
+                                counts.contributed,
+                                counts.boundary_contributed);
+      }, "Get current rank type counts as tuple: (majors, minors, major_spares, minor_spares, boundary_minors, contributed, boundary_contributed)");
 
   // ULFM logging control
   m.def("set_ulfm_verbose_logging", &c10d::set_ulfm_verbose_logging, 

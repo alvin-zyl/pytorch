@@ -317,9 +317,16 @@ class TORCH_API ProcessGroupULFM : public ProcessGroup {
     return is_boundary_minor_.load(std::memory_order_acquire);
   }
 
-  // Set the boundary minor split: ranks < num_boundary_majors are not boundary minor,
-  // ranks >= num_boundary_majors are boundary minor
-  void set_boundary_minor_split(int num_boundary_majors, int64_t workload);
+  // Set the boundary minor split and directly populate the boundary-phase
+  // contribution target for this rank:
+  //   ranks <  num_boundary_majors -> boundary_target_contribution_ = boundary_major_workload
+  //   ranks >= num_boundary_majors -> boundary_target_contribution_ = boundary_minor_workload
+  // boundary_contributed_ is reset to 0 on every call. The caller is
+  // responsible for sizing the two workloads so they sum to the total
+  // global contribution target required by the policy.
+  void set_boundary_minor_split(int num_boundary_majors,
+                                int64_t boundary_major_workload,
+                                int64_t boundary_minor_workload);
 
   // Set rank type based on explicit counts
   // Layout: [major workers | major spares | minor workers | minor spares]
@@ -402,15 +409,46 @@ class TORCH_API ProcessGroupULFM : public ProcessGroup {
 
   // Local count of how many times this rank contributed gradients to allreduce.
   // Call increment_contributed() from the Python control plane when this rank's
-  // gradient was not zeroed before the allreduce.
+  // gradient was not zeroed before the allreduce. During the extended pass at
+  // a policy boundary (is_at_policy_boundary() == true) all ranks route their
+  // increments into boundary_contributed_ so the boundary phase is tracked
+  // separately from the regular accumulation window.
   int64_t get_contributed() const {
     return contributed_.load(std::memory_order_acquire);
   }
   void increment_contributed() {
-    contributed_.fetch_add(1, std::memory_order_relaxed);
+    if (is_at_policy_boundary()) {
+      boundary_contributed_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      contributed_.fetch_add(1, std::memory_order_relaxed);
+    }
   }
   void reset_contributed() {
     contributed_.store(0, std::memory_order_release);
+    boundary_contributed_.store(0, std::memory_order_release);
+  }
+
+  // Boundary-phase counterpart of contributed_: incremented by every rank
+  // during the extended microbatches at a policy boundary.
+  int64_t get_boundary_contributed() const {
+    return boundary_contributed_.load(std::memory_order_acquire);
+  }
+  void reset_boundary_contributed() {
+    boundary_contributed_.store(0, std::memory_order_release);
+  }
+  // Fold the boundary-phase contribution counter into the regular counter
+  // and zero both boundary_contributed_ and boundary_target_contribution_
+  // (the stale target from the previous extension is repopulated by the
+  // next set_boundary_minor_split call). Called when a failure is observed
+  // during an active boundary extended pass so the next extension can
+  // stack on top of the already-accounted-for contributions.
+  void merge_boundary_contributed() {
+    int64_t boundary =
+        boundary_contributed_.exchange(0, std::memory_order_acq_rel);
+    if (boundary != 0) {
+      contributed_.fetch_add(boundary, std::memory_order_relaxed);
+    }
+    boundary_target_contribution_.store(0, std::memory_order_release);
   }
 
   // Target contribution: a settable/incrementable goal value controlled from
@@ -431,9 +469,26 @@ class TORCH_API ProcessGroupULFM : public ProcessGroup {
     target_contribution_.fetch_add(delta, std::memory_order_relaxed);
   }
 
-  // Returns true if this rank has not yet reached its target contribution,
-  // i.e. contributed_ < target_contribution_.
+  // Boundary-phase target: how many contributions a rank should make during
+  // the extended pass at a policy boundary (workload for non-boundary-minor
+  // ranks, workload - 1 for boundary-minor ranks).
+  int64_t get_boundary_target_contribution() const {
+    return boundary_target_contribution_.load(std::memory_order_acquire);
+  }
+  void set_boundary_target_contribution(int64_t value) {
+    TORCH_CHECK(value >= 0, "boundary_target_contribution must be non-negative");
+    boundary_target_contribution_.store(value, std::memory_order_release);
+  }
+
+  // Returns true if this rank has not yet reached its target contribution.
+  // During the extended pass at a policy boundary all ranks compare against
+  // the boundary-phase counters so the boundary workload is tracked
+  // independently from the regular accumulation window.
   bool should_contribute() const {
+    if (is_at_policy_boundary()) {
+      return boundary_contributed_.load(std::memory_order_acquire) <
+             boundary_target_contribution_.load(std::memory_order_acquire);
+    }
     return contributed_.load(std::memory_order_acquire) <
            target_contribution_.load(std::memory_order_acquire);
   }
@@ -597,6 +652,10 @@ class TORCH_API ProcessGroupULFM : public ProcessGroup {
 
   // Target contribution: settable/incrementable goal value controlled from Python
   std::atomic<int64_t> target_contribution_{0};
+
+  // Boundary-phase counterparts used only while is_boundary_minor_ is true.
+  std::atomic<int64_t> boundary_contributed_{0};
+  std::atomic<int64_t> boundary_target_contribution_{0};
 };
 
 } // namespace c10d
