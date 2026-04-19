@@ -786,9 +786,6 @@ class StepTxnOrchestrator:
             logger.debug(f"[Rank {self._rank}] No deferred buckets to allreduce")
             return True
 
-        # Ensure all GPU work (backward, TP allreduces) is complete
-        torch.cuda.synchronize()
-
         opts = torch.distributed.AllreduceOptions()
         opts.reduceOp = torch.distributed.ReduceOp.SUM
         ulfm_opts = self._ulfm_opts
