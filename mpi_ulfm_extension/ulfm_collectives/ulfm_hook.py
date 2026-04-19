@@ -367,13 +367,12 @@ def create_ulfm_hsdp_hook(ulfm_opts: ULFM.ULFMOptions = None):
             fut.set_result(grad_shard)
             return fut
 
-        # 2) Sync GPU work before entering MPI (same rationale as DDP hook).
-        torch.cuda.synchronize()
-
-        # 3) Snapshot the bf16 shard grad for restore.
+        # 2) Snapshot the bf16 shard grad for restore.
         orch.on_bucket_snapshot(grad_shard, unit_index, pg)
 
-        # 4) Submit ulfm_allreduce on replicate_pg. up/down-cast lives in C++.
+        # 3) Submit ulfm_allreduce on replicate_pg. up/down-cast lives in C++.
+        #    ulfm_allreduce records a CUDA event on the current stream and the
+        #    worker thread blocks on it before MPI, so no Python-side sync here.
         work = pg.ulfm_allreduce([grad_shard], opts, ulfm_opts)
 
         def on_done(fut):
