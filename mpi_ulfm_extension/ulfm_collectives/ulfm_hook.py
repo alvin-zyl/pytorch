@@ -98,15 +98,7 @@ def create_ulfm_recovery_hook(ulfm_opts: ULFM.ULFMOptions = None):
             fut.set_result(bucket.buffer())
             return fut
 
-        # 2) Ensure all GPU work (TP allreduces from pipeline fwd/bwd) has
-        #    truly completed before we snapshot or enter MPI.  Without this,
-        #    the CPU can race ahead of a stuck GPU stream: if a TP partner is
-        #    dead the NCCL ops on this rank's stream never finish, but the CPU
-        #    would still enter MPI — dragging the healthy DP partner into a
-        #    blocked collective.  With the sync, a stuck rank blocks HERE
-        #    (never enters MPI) and eventually dies via NCCL watchdog, letting
-        #    the DP partner discover the failure through ULFM comm_agree.
-        torch.cuda.synchronize()
+        # 2) Snapshot the entire bucket buffer (pre-reduce)
 
         # 3) Snapshot the entire bucket buffer (pre-reduce)
         logger.debug(
