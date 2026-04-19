@@ -8,7 +8,9 @@
 #include <map>
 
 #include <cuda_runtime.h>
+#include <ATen/cuda/CUDAEvent.h>
 #include <c10/core/DeviceGuard.h>
+#include <c10/cuda/CUDAStream.h>
 #include <c10/util/irange.h>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 
@@ -638,14 +640,27 @@ c10::intrusive_ptr<Work> ProcessGroupULFM::ulfm_allreduce(
     std::vector<at::Tensor>& tensors,
     const AllreduceOptions& opts,
     const ULFMOptions& ulfm_opts) {
-  
+
   checkSingleTensor(tensors);
   const int epoch_at_enqueue = worldEpoch();
 
+  // Record a CUDA event on the caller's current stream so the worker thread
+  // can block on GPU-side producers (reduce_scatter, snapshot clone, etc.)
+  // without the caller having to torch.cuda.synchronize() on the main thread.
+  std::shared_ptr<at::cuda::CUDAEvent> input_ready;
+  if (tensors[0].is_cuda()) {
+    input_ready = std::make_shared<at::cuda::CUDAEvent>();
+    input_ready->record(
+        c10::cuda::getCurrentCUDAStream(tensors[0].device().index()));
+  }
+
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
-      [opts, ulfm_opts, this, epoch_at_enqueue](std::unique_ptr<WorkEntry>& entry) {
+      [opts, ulfm_opts, this, epoch_at_enqueue, input_ready](std::unique_ptr<WorkEntry>& entry) {
         auto data = (entry->src)[0];
         c10::DeviceGuard guard(data.device());
+        if (input_ready) {
+          input_ready->synchronize();
+        }
         ULFM_LOG_DEBUG(currentRank_, "ulfm_allreduce: waiting for pgGlobalMutex_");
         std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
         ULFM_LOG_DEBUG(currentRank_, "ulfm_allreduce: pgGlobalMutex_ acquired");
