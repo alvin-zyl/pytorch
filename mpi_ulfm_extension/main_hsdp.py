@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.utils.data
 import torch.distributed as dist
-from torch.distributed.fsdp import FullyShardedDataParallel, ShardingStrategy
+from torch.distributed.fsdp import FullyShardedDataParallel, MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
@@ -32,6 +32,11 @@ try:
     import ulfm_collectives as ULFM
     from ulfm_collectives.training_manager import ULFMTrainingManager
     from ulfm_collectives.failure_simulator import FailureSimulator, set_failure_simulator
+    from ulfm_collectives.failure import (
+        FailureSchedule,
+        ParallelismSpec,
+        generate as generate_failure_schedule,
+    )
     from ulfm_collectives.hsdp_groups import (
         compute_hsdp_layout,
         replica_ranks,
@@ -135,18 +140,72 @@ def parse_args(args):
         help="Cross-replica backend: 'nccl' (baseline) or 'ulfm' (fault-tolerant).",
     )
     parser.add_argument(
+        "--mixed_precision",
+        default=False,
+        action="store_true",
+        help="Enable FSDP native mixed precision: bf16 compute, fp32 reduce, "
+             "fp32 master weights. Requires the model to remain in fp32; "
+             "when set, the --dtype bf16 cast below is skipped.",
+    )
+    parser.add_argument(
         "--hsdp_shard_size",
         type=int,
         default=None,
         help="Ranks per FSDP replica. Default: torch.cuda.device_count(). "
              "world_size must be divisible by this value.",
     )
+    # --------------------------------------------------------------
+    # Failure schedule (deterministic replica-aware).
+    # Either load a pre-generated YAML via --failure_schedule, or generate
+    # inline with --failure_count + --failure_step_range + --failure_locations.
+    # The two are mutually exclusive. If neither is given, no failures are injected.
+    # --------------------------------------------------------------
     parser.add_argument(
-        "--failure_start_step",
+        "--failure_schedule",
+        type=str,
+        default=None,
+        help="Path to a YAML failure schedule (see scripts/generate_failure_schedule.py).",
+    )
+    parser.add_argument(
+        "--failure_count",
         type=int,
         default=0,
-        help="Minibatch index at which the failure simulator begins injecting failures. "
-             "Useful to let training stabilize before testing fault tolerance.",
+        help="Inline generator: number of replicas to kill. 0 disables injection.",
+    )
+    parser.add_argument(
+        "--failure_seed",
+        type=int,
+        default=0,
+        help="Inline generator seed. All ranks must pass the same value.",
+    )
+    parser.add_argument(
+        "--failure_step_range",
+        type=int,
+        nargs=2,
+        default=None,
+        metavar=("START", "END"),
+        help="Inline generator: half-open [START, END) minibatch index range for kills.",
+    )
+    parser.add_argument(
+        "--failure_sampling",
+        choices=("iid", "stratified"),
+        default="stratified",
+        help="Inline generator: step-sampling mode.",
+    )
+    parser.add_argument(
+        "--failure_locations",
+        nargs="+",
+        default=None,
+        metavar="NAME:WEIGHT",
+        help="Inline generator: location:weight pairs (e.g. post-allreduce:0.6 backward:0.4).",
+    )
+    parser.add_argument(
+        "--failure_exclude_replicas",
+        type=str,
+        default="0",
+        help="Comma-separated replica ids to spare from selection "
+             "(default '0' spares the replica that contains global rank 0, "
+             "which hosts wandb). Pass empty string to allow all replicas.",
     )
 
     args = parser.parse_args(args)
@@ -269,6 +328,66 @@ def build_hsdp_groups(world_size: int, shard_size: int, backend: str):
     return shard_pg, replicate_pg, layout
 
 
+def _build_failure_simulator(args, world_size: int, shard_size: int):
+    """Return a configured FailureSimulator.
+
+    Resolves the schedule from either --failure_schedule (YAML file) or the
+    inline --failure_count / --failure_step_range / --failure_locations
+    flags. The two sources are mutually exclusive. When no failures are
+    requested, returns a simulator with an empty schedule so downstream
+    ``begin_minibatch`` / ``may_fail_here`` calls become no-ops.
+    """
+    spec = ParallelismSpec(kind="hsdp", world_size=world_size, shard_size=shard_size)
+
+    if args.failure_schedule and args.failure_count > 0:
+        raise ValueError(
+            "--failure_schedule and --failure_count are mutually exclusive; "
+            "pick one source for the failure schedule."
+        )
+
+    if args.failure_schedule:
+        schedule = FailureSchedule.load(args.failure_schedule)
+        schedule.assert_matches_topology(spec)
+        return FailureSimulator(schedule=schedule)
+
+    if args.failure_count <= 0:
+        empty = FailureSchedule(parallelism=spec, generator_config=None, entries=())
+        return FailureSimulator(schedule=empty, enabled=False)
+
+    if args.failure_step_range is None:
+        raise ValueError(
+            "--failure_count > 0 requires --failure_step_range START END."
+        )
+    if not args.failure_locations:
+        raise ValueError(
+            "--failure_count > 0 requires --failure_locations NAME:WEIGHT ..."
+        )
+
+    weights = {}
+    for item in args.failure_locations:
+        if ":" not in item:
+            raise ValueError(
+                f"--failure_locations entry {item!r} must be NAME:WEIGHT."
+            )
+        name, weight = item.rsplit(":", 1)
+        weights[name] = float(weight)
+
+    exclude_str = (args.failure_exclude_replicas or "").strip()
+    exclude_ids = [int(x) for x in exclude_str.split(",") if x.strip()] if exclude_str else []
+
+    start, end = args.failure_step_range
+    schedule = generate_failure_schedule(
+        parallelism=spec,
+        seed=args.failure_seed,
+        num_failures=args.failure_count,
+        step_range=(start, end),
+        location_weights=weights,
+        sampling=args.failure_sampling,
+        exclude_replica_ids=exclude_ids,
+    )
+    return FailureSimulator(schedule=schedule)
+
+
 def main(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -346,17 +465,13 @@ def main(args):
     device = f"cuda:{local_rank}"
 
     if _ULFM_AVAILABLE and not args.single_gpu and args.backend == "ulfm":
-        sim = FailureSimulator(
-            seed=42,
-            desired_failures=0,
-            total_minibatches=100 * args.gradient_accumulation,
-            target_ranks=None,
-            config_path=None,
-            start_minibatch=args.failure_start_step,
-        )
-        sim.excluded_ranks = set(replica0_ranks(shard_size))
-        set_failure_simulator(sim)
-        sim.initialize(rank=global_rank, world_size=world_size)
+        sim = _build_failure_simulator(args, world_size=world_size, shard_size=shard_size)
+        if sim is not None:
+            if global_rank == 0:
+                for _line in sim.describe().splitlines():
+                    logger.info(_line)
+            set_failure_simulator(sim)
+            sim.initialize(rank=global_rank, world_size=world_size)
     else:
         sim = None
 
@@ -494,7 +609,7 @@ def main(args):
         model_config = AutoConfig.from_pretrained(args.model_config)
         model = AutoModelForCausalLM.from_config(model_config)
         
-        if args.dtype in ["bf16", "bfloat16"]:
+        if args.dtype in ["bf16", "bfloat16"] and not args.mixed_precision:
             model = model.to(device=device, dtype=torch.bfloat16)
         else:
             model = model.to(device=device)
@@ -507,6 +622,14 @@ def main(args):
             transformer_auto_wrap_policy,
             transformer_layer_cls={LlamaDecoderLayer},
         )
+        mp_policy = None
+        if args.mixed_precision:
+            mp_policy = MixedPrecision(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+                buffer_dtype=torch.bfloat16,
+                keep_low_precision_grads=False,
+            )
         model = FullyShardedDataParallel(
             LMWrapper(model),
             sharding_strategy=ShardingStrategy.HYBRID_SHARD,
@@ -514,7 +637,7 @@ def main(args):
             auto_wrap_policy=wrap_policy,
             device_id=local_rank,
             use_orig_params=True,
-            mixed_precision=None,
+            mixed_precision=mp_policy,
         )
 
     global_step = 0
@@ -638,6 +761,7 @@ def main(args):
     if global_rank == 0:
         print(f"Rank {global_rank} starting training loop.")
 
+    stepped = False
     for batch_idx, batch in enumerate(train_dataloader):
         if batch_idx // args.gradient_accumulation < update_step:
             # Skipping data that are already seen in previous steps
@@ -699,6 +823,11 @@ def main(args):
                 optimizer.step()
                 optimizer.zero_grad()
         else:
+            if not stepped:
+                ulfm_opts = ULFM.ULFMOptions(auto_repair=True)
+                work = dist.group.WORLD.consensus(ulfm_opts)
+                work.wait()
+            
             sim.begin_minibatch(batch_idx)
             with sim.may_fail_here("pre-forward"):
                 loss, stepped = training_manager.train_step(

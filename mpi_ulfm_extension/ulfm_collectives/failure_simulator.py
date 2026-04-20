@@ -1,471 +1,155 @@
 #!/usr/bin/env python3
-"""
-Failure Simulator for ULFM Fault-Tolerant Training
+"""Deterministic replica-aware failure simulator.
 
-A minibatch-based stochastic failure simulator. Register possible failure
-locations with decorators or context managers. At each minibatch, the simulator
-decides whether to fail and randomly picks one registered location.
+The simulator consumes a pre-computed :class:`FailureSchedule` (loaded from
+YAML or produced at init time by :mod:`ulfm_collectives.failure.generator`)
+and SIGKILLs the targeted rank at the scheduled step/location.
 
-Usage:
-    from failure_simulator import FailureSimulator, set_failure_simulator
+Public API (unchanged from prior revisions; internals rewritten):
 
-    sim = FailureSimulator(
-        seed=42,
-        desired_failures=2,      # Expected total failures across all ranks
-        total_minibatches=100,   # Total minibatches in training
-        target_ranks={1, 2},     # Ranks that can fail
-    )
+    sim = FailureSimulator(schedule)
     set_failure_simulator(sim)
     sim.initialize(rank=dist.get_rank(), world_size=dist.get_world_size())
 
-    # Register locations with decorator (registers at decoration time)
     @sim.may_fail("forward_pass")
-    def forward(x):
-        return model(x)
+    def forward(x): ...
 
-    # Or context manager (registers on first use)
-
-    # Training loop
-    for minibatch in range(total_minibatches):
-        sim.begin_minibatch(minibatch)  # Decides if/where to fail
-        # Note: minibatch 0 is skipped to allow context managers to register
-
-        output = forward(x)  # May fail here if selected
-
+    for step in range(num_steps):
+        sim.begin_minibatch(step)
+        output = forward(x)
         with sim.may_fail_here("backward"):
-            loss.backward()  # May fail here if selected
+            loss.backward()
+
+See ``docs/superpowers/specs/2026-04-19-failure-simulator-deterministic-schedule-design.md``
+for the full design.
 """
 
+import logging
 import os
 import signal
-import random
 import threading
-import logging
 import time
 from contextlib import contextmanager
-from functools import wraps
-from typing import Optional, Set, List, Dict, Tuple
 from dataclasses import dataclass, field
+from functools import wraps
+from typing import Dict, List, Optional, Set
 
-try:
-    import yaml
-    _YAML_AVAILABLE = True
-except ImportError:
-    _YAML_AVAILABLE = False
+from .failure.schedule import FailureEntry, FailureSchedule
+from .failure.topology import expected_world_size, replicas_for
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class SimulatorState:
-    """Current state for decision making."""
+class _State:
     rank: int = -1
     world_size: int = -1
-    minibatch: int = 0
-    # Per-minibatch failure decision
-    should_fail_this_minibatch: bool = False
-    target_location: Optional[str] = None
+    step: int = -1
+    armed_entry: Optional[FailureEntry] = None
 
 
 @dataclass
 class FailureRecord:
-    """Record of an injected failure."""
     location: str
     rank: int
-    minibatch: int
+    step: int
     timestamp: float = field(default_factory=time.time)
 
 
 class FailureSimulator:
-    """
-    Stochastic failure simulator for ULFM testing.
+    """Schedule-driven failure injector.
 
-    Failure injection is tied to minibatches:
-    1. Register possible failure locations with decorators or context managers
-    2. Call begin_minibatch() at the start of each minibatch
-    3. The simulator decides if this minibatch should fail (minibatch 0 is skipped
-       to allow context managers to register on first use)
-    4. If failing, one registered location is randomly chosen to inject SIGKILL
-
-    The probability is auto-computed from desired_failures, total_minibatches,
-    and number of target ranks using: p = 1 - (1 - F/N)^(1/S)
-
-    Args:
-        seed: Random seed for reproducibility. Different seeds produce
-              different failure sequences.
-        desired_failures: Expected total number of failures across ALL ranks.
-                         The probability is computed to achieve this on average.
-        total_minibatches: Total number of minibatches in training.
-        target_ranks: Set of ranks that can fail. None means any rank can fail.
-        enabled: Whether injection is active. Set to False to disable.
+    Parameters
+    ----------
+    schedule:
+        The schedule to execute. Every rank must construct a simulator with
+        the *same* schedule (either loaded from the same file or produced by
+        the generator with identical inputs).
+    enabled:
+        If False, the simulator registers locations and logs but never kills.
     """
 
-    @staticmethod
-    def compute_probability(
-        total_minibatches: int,
-        desired_failures: int,
-        num_target_ranks: int,
-    ) -> float:
-        """
-        Compute per-minibatch failure probability to achieve desired total failures.
-
-        Uses the formula: p = 1 - (1 - F/N)^(1/S)
-
-        This ensures that across all target ranks and minibatches, the expected
-        number of failures equals desired_failures.
-
-        Args:
-            total_minibatches: Total number of minibatches in training
-            desired_failures: Target number of total failures across all ranks
-            num_target_ranks: Number of ranks that can fail (len(target_ranks))
-
-        Returns:
-            Probability value between 0.0 and 1.0
-        """
-        if desired_failures <= 0:
-            return 0.0
-        if num_target_ranks <= 0:
-            return 0.0
-        if total_minibatches <= 0:
-            return 0.0
-        if desired_failures >= num_target_ranks:
-            # Can't have more failures than target ranks (each dies once)
-            # Set high probability to ensure all target ranks fail
-            return 1.0 - (1e-9) ** (1.0 / total_minibatches)
-
-        # p = 1 - (1 - F/N)^(1/S)
-        survival_ratio = 1.0 - desired_failures / num_target_ranks
-        prob = 1.0 - survival_ratio ** (1.0 / total_minibatches)
-        return prob
-
-    def __init__(
-        self,
-        seed: int = 42,
-        desired_failures: int = 1,
-        total_minibatches: int = 100,
-        target_ranks: Optional[Set[int]] = None,
-        excluded_ranks: Optional[Set[int]] = None,
-        enabled: bool = True,
-        config_path: Optional[str] = None,
-        start_minibatch: int = 0,
-    ):
-        self.seed = seed
-        self.desired_failures = desired_failures
-        self.total_minibatches = total_minibatches
-        self.target_ranks = target_ranks
-        self.excluded_ranks = excluded_ranks or set()
+    def __init__(self, schedule: FailureSchedule, enabled: bool = True) -> None:
+        self.schedule = schedule
         self.enabled = enabled
-        self.start_minibatch = max(1, start_minibatch)  # minibatch 0 always skipped
-
-        # Computed in initialize() once we know world_size
-        self._failure_probability: float = 0.0
 
         self._lock = threading.RLock()
-        self._rng: Optional[random.Random] = None
-        self._has_failed = False  # Each rank can only fail once
-        self._history: List[FailureRecord] = []
-        self._state = SimulatorState()
+        self._state = _State()
         self._initialized = False
+        self._has_failed = False
 
-        # Registered failure locations (populated by decorators/context managers)
+        # Entries assigned to *this* rank (resolved in initialize()).
+        self._my_entries: Dict[int, FailureEntry] = {}
+
+        # Locations known to the simulator (decorator / context manager).
         self._registered_locations: Set[str] = set()
+        self._location_scan_done = False
 
-        # Config-driven locations: maps location name -> explicit probability or None.
-        # None means "auto": gets an equal share of whatever probability remains after
-        # summing the explicitly specified ones.
-        # If _config_locations is None (no config given), fall back to _registered_locations.
-        self._config_locations: Optional[Dict[str, Optional[float]]] = None
-        if config_path is not None:
-            self._config_locations = self._load_config(config_path)
+        self._history: List[FailureRecord] = []
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     def initialize(self, rank: int, world_size: int) -> None:
-        """
-        Initialize with distributed context.
-
-        Must be called after dist.init_process_group() or equivalent.
-        Each rank gets a unique RNG seed (base_seed + rank) for independent
-        random sequences across processes.
-
-        Computes failure probability based on desired_failures, total_minibatches,
-        and number of target ranks.
-
-        Args:
-            rank: This process's rank in the distributed group
-            world_size: Total number of processes
-        """
         with self._lock:
+            expected = expected_world_size(self.schedule.parallelism)
+            if world_size != expected:
+                raise RuntimeError(
+                    f"schedule expects world_size={expected} "
+                    f"(parallelism={self.schedule.parallelism.to_dict()}), "
+                    f"but runtime world_size={world_size}"
+                )
+
             self._state.rank = rank
             self._state.world_size = world_size
 
-            # Compute number of target ranks (excluding protected ranks)
-            if self.target_ranks is not None:
-                num_target_ranks = len(self.target_ranks - self.excluded_ranks)
-            else:
-                num_target_ranks = world_size - len(self.excluded_ranks)
-
-            # Compute probability over the effective window (after start_minibatch)
-            effective_minibatches = max(1, self.total_minibatches - self.start_minibatch)
-            self._failure_probability = self.compute_probability(
-                total_minibatches=effective_minibatches,
-                desired_failures=self.desired_failures,
-                num_target_ranks=num_target_ranks,
-            )
-
-            # Unique seed per rank for independent random sequences
-            self._rng = random.Random(self.seed + rank)
+            replicas = replicas_for(self.schedule.parallelism)
+            my_entries: Dict[int, FailureEntry] = {}
+            for entry in self.schedule.entries:
+                global_rank = replicas[entry.replica_id][entry.local_rank]
+                if global_rank == rank:
+                    # By construction each replica appears at most once in the
+                    # schedule, so at most one entry can land on this rank.
+                    # Assert to catch construction-time regressions.
+                    assert entry.step not in my_entries, (
+                        f"two scheduled entries target the same step on rank {rank}"
+                    )
+                    my_entries[entry.step] = entry
+            self._my_entries = my_entries
             self._initialized = True
 
-            logger.info(
-                f"[Rank {rank}] FailureSimulator initialized: "
-                f"seed={self.seed}, desired_failures={self.desired_failures}, "
-                f"total_minibatches={self.total_minibatches}, "
-                f"start_minibatch={self.start_minibatch}, "
-                f"effective_window={effective_minibatches}, "
-                f"computed_probability={self._failure_probability:.6f}, "
-                f"target_ranks={self.target_ranks}"
-            )
+            if rank == 0:
+                self._log_schedule_banner(replicas)
+
+            if my_entries:
+                for step, e in sorted(my_entries.items()):
+                    logger.info(
+                        "[Rank %d] assigned failure: step=%d location=%s "
+                        "(replica=%d, local_rank=%d)",
+                        rank,
+                        step,
+                        e.location,
+                        e.replica_id,
+                        e.local_rank,
+                    )
+            else:
+                logger.info("[Rank %d] no failures assigned", rank)
+
+    # ------------------------------------------------------------------
+    # Location registration (decorator / context manager)
+    # ------------------------------------------------------------------
 
     def register_location(self, location: str) -> None:
-        """
-        Register a location as a possible failure point.
-
-        Locations are automatically registered when using may_fail() decorator
-        or may_fail_here() context manager. This method allows manual registration.
-
-        Args:
-            location: Name of the failure point
-        """
         with self._lock:
             self._registered_locations.add(location)
 
     def get_registered_locations(self) -> Set[str]:
-        """Get all registered failure locations."""
         with self._lock:
-            return self._registered_locations.copy()
-
-    def _load_config(self, path: str) -> Dict[str, Optional[float]]:
-        """
-        Load failure locations (and optional per-location probabilities) from a YAML file.
-
-        Expected format::
-
-            locations:
-              ddp_allreduce: 0.5      # explicit probability (fraction of failures)
-              forward_pass: 0.3       # explicit probability
-              backward:               # null/absent → auto (even share of remainder)
-
-        The probability values are *selection weights*: they describe what fraction
-        of the scheduled failures should target that location.  Values must be in
-        [0, 1] and their sum must not exceed 1.0.  Locations whose value is null
-        or omitted receive an equal share of whatever fraction remains.
-
-        Args:
-            path: Path to the YAML config file.
-
-        Returns:
-            Dict mapping location name to explicit probability (float) or None (auto).
-
-        Raises:
-            ImportError: if PyYAML is not installed.
-            ValueError: if the config is malformed or probabilities exceed 1.0.
-        """
-        if not _YAML_AVAILABLE:
-            raise ImportError(
-                "PyYAML is required to load a failure simulator config. "
-                "Install it with: pip install pyyaml"
-            )
-
-        with open(path, "r") as f:
-            raw = yaml.safe_load(f)
-
-        if not isinstance(raw, dict) or "locations" not in raw:
-            raise ValueError(
-                f"Config file '{path}' must have a top-level 'locations' key."
-            )
-
-        locations_raw = raw["locations"]
-        if not isinstance(locations_raw, dict):
-            raise ValueError(
-                f"'locations' in '{path}' must be a mapping of name -> probability."
-            )
-
-        result: Dict[str, Optional[float]] = {}
-        for name, value in locations_raw.items():
-            if value is None:
-                result[name] = None
-            else:
-                p = float(value)
-                if not (0.0 <= p <= 1.0):
-                    raise ValueError(
-                        f"Probability for location '{name}' must be in [0, 1], got {p}."
-                    )
-                result[name] = p
-
-        # Validate sum of explicit probs
-        explicit_sum = sum(p for p in result.values() if p is not None)
-        if explicit_sum > 1.0 + 1e-9:
-            raise ValueError(
-                f"Sum of explicit location probabilities ({explicit_sum:.4f}) exceeds 1.0."
-            )
-
-        logger.info(
-            f"Loaded failure simulator config from '{path}': {list(result.keys())}"
-        )
-        return result
-
-    def _get_active_locations_with_weights(self) -> Dict[str, float]:
-        """
-        Return the set of active locations and their selection weights (sum = 1.0).
-
-        If a YAML config was provided:
-          - Only config locations are eligible.
-          - Explicit probabilities are used directly as weights.
-          - Locations with no explicit probability share the remaining weight evenly.
-
-        If no config was provided:
-          - All registered locations are eligible with uniform weights.
-
-        Must be called with self._lock held.
-        """
-        if self._config_locations is not None:
-            locations = self._config_locations
-        else:
-            n = len(self._registered_locations)
-            if n == 0:
-                return {}
-            w = 1.0 / n
-            return {loc: w for loc in self._registered_locations}
-
-        if not locations:
-            return {}
-
-        explicit: Dict[str, float] = {
-            loc: p for loc, p in locations.items() if p is not None
-        }
-        auto_locs: List[str] = [loc for loc, p in locations.items() if p is None]
-
-        explicit_sum = sum(explicit.values())
-        remaining = max(0.0, 1.0 - explicit_sum)
-
-        weights = dict(explicit)
-        if auto_locs:
-            auto_weight = remaining / len(auto_locs)
-            for loc in auto_locs:
-                weights[loc] = auto_weight
-
-        return weights
-
-    def begin_minibatch(self, minibatch: int) -> None:
-        """
-        Begin a new minibatch and decide if failure should occur.
-
-        Call this at the start of each minibatch. The simulator will:
-        1. Decide if this minibatch should have a failure (based on probability)
-        2. If yes, randomly select one registered location as the target
-
-        Note: Minibatch 0 is always skipped to allow location registration to
-        complete (context managers register on first use).
-
-        Args:
-            minibatch: Current minibatch index (0-based)
-        """
-        with self._lock:
-            self._state.minibatch = minibatch
-            self._state.should_fail_this_minibatch = False
-            self._state.target_location = None
-
-            if not self.enabled:
-                return
-            if not self._initialized or self._rng is None:
-                logger.warning("FailureSimulator not initialized, skipping minibatch decision")
-                return
-            if self._has_failed:
-                return
-            if self.target_ranks is not None and self._state.rank not in self.target_ranks:
-                return
-            if self._state.rank in self.excluded_ranks:
-                return
-            # Determine active locations; prefer config over registered
-            active_weights = self._get_active_locations_with_weights()
-            if not active_weights:
-                logger.warning("No locations available for failure injection, cannot inject failure")
-                return
-
-            # Skip first minibatch to allow location registration to complete
-            if minibatch == 0:
-                return
-
-            # Don't inject before start_minibatch
-            if minibatch < self.start_minibatch:
-                return
-
-            # Decide if this minibatch should fail
-            if self._rng.random() < self._failure_probability:
-                self._state.should_fail_this_minibatch = True
-                # Weighted random selection of target location
-                loc_names = list(active_weights.keys())
-                loc_weights = [active_weights[loc] for loc in loc_names]
-                self._state.target_location = self._rng.choices(loc_names, weights=loc_weights, k=1)[0]
-                logger.debug(
-                    f"[Rank {self._state.rank}] Minibatch {minibatch}: "
-                    f"scheduled failure at '{self._state.target_location}'"
-                )
-
-    def _inject(self, location: str) -> None:
-        """Execute SIGKILL to simulate process failure."""
-        with self._lock:
-            record = FailureRecord(
-                location=location,
-                rank=self._state.rank,
-                minibatch=self._state.minibatch,
-            )
-            self._history.append(record)
-            self._has_failed = True
-
-            logger.warning(
-                f"[Rank {self._state.rank}] INJECTING FAILURE at '{location}', "
-                f"minibatch={self._state.minibatch}"
-            )
-
-        # SIGKILL for immediate process termination
-        os.kill(os.getpid(), signal.SIGKILL)
-
-    def check(self, location: str) -> bool:
-        """
-        Check if failure should be injected at this location.
-
-        Only injects if:
-        1. This minibatch was selected for failure (via begin_minibatch)
-        2. This location was randomly chosen as the target
-
-        Args:
-            location: Name of the failure point
-
-        Returns:
-            True if failure was injected (process will die, so won't return)
-            False if no failure was injected
-        """
-        with self._lock:
-            if (self._state.should_fail_this_minibatch and
-                self._state.target_location == location):
-                self._inject(location)
-                return True  # Won't reach here due to SIGKILL
-            return False
+            return set(self._registered_locations)
 
     def may_fail(self, location: str):
-        """
-        Decorator to mark a function as a possible failure point.
-
-        Registers the location and checks for failure at function entry.
-
-        Usage:
-            @simulator.may_fail("forward_pass")
-            def forward(self, x):
-                return self.model(x)
-
-        Args:
-            location: Name for this failure point
-        """
+        """Decorator. Registers ``location`` at decoration time; checks on call."""
         self.register_location(location)
 
         def decorator(func):
@@ -473,59 +157,195 @@ class FailureSimulator:
             def wrapper(*args, **kwargs):
                 self.check(location)
                 return func(*args, **kwargs)
+
             return wrapper
+
         return decorator
 
     @contextmanager
     def may_fail_here(self, location: str):
-        """
-        Context manager to mark a code block as a possible failure point.
-
-        Registers the location and checks for failure at context entry.
-
-        Usage:
-            with simulator.may_fail_here("backward"):
-                loss.backward()
-
-        Args:
-            location: Name for this failure point
-        """
+        """Context manager. Registers ``location`` on first ``__enter__``; checks on entry."""
         self.register_location(location)
         self.check(location)
         yield
 
-    @property
-    def failure_probability(self) -> float:
-        """Computed failure probability per check point."""
-        return self._failure_probability
+    # ------------------------------------------------------------------
+    # Per-step arming / checking
+    # ------------------------------------------------------------------
+
+    def begin_minibatch(self, step: int) -> None:
+        """Arm this rank for ``step`` if an entry is scheduled at that step.
+
+        Also performs a one-shot best-effort scan for scheduled locations
+        that are not in the registry. Warnings may over-warn for
+        ``may_fail_here`` locations that register only on first loop entry.
+        """
+        with self._lock:
+            self._state.step = step
+            self._state.armed_entry = None
+
+            if not self.enabled or not self._initialized:
+                return
+            if self._has_failed:
+                return
+
+            if not self._location_scan_done:
+                self._location_scan_done = True
+                self._warn_unregistered_locations()
+
+            entry = self._my_entries.get(step)
+            if entry is not None:
+                self._state.armed_entry = entry
+                logger.debug(
+                    "[Rank %d] step=%d armed for location=%s",
+                    self._state.rank,
+                    step,
+                    entry.location,
+                )
+
+    def describe(self) -> str:
+        """Return a human-readable, multi-line dump of the full schedule.
+
+        Includes parallelism, generator config (if present), a per-entry
+        table with global-rank resolution, and the full YAML form for
+        copy/paste reproducibility. Safe to call any time (does not require
+        :meth:`initialize`).
+        """
+        replicas = replicas_for(self.schedule.parallelism)
+        lines: List[str] = []
+        sep = "=" * 72
+        lines.append(sep)
+        lines.append(
+            f"FailureSimulator schedule ({len(self.schedule.entries)} entries)"
+        )
+        lines.append(f"  parallelism: {self.schedule.parallelism.to_dict()}")
+        gc = self.schedule.generator_config
+        if gc is not None:
+            lines.append(
+                f"  generator: seed={gc.seed} num_failures={gc.num_failures} "
+                f"step_range={tuple(gc.step_range)} sampling={gc.sampling} "
+                f"locations={dict(sorted(gc.location_weights.items()))} "
+                f"exclude_replica_ids="
+                f"{list(gc.exclude_replica_ids) if gc.exclude_replica_ids else []}"
+            )
+        else:
+            lines.append("  generator: <loaded from file, no generator_config>")
+
+        if self.schedule.entries:
+            lines.append(
+                f"  {'step':>6}  {'replica':>7}  {'local':>5}  "
+                f"{'global':>6}  location"
+            )
+            for e in self.schedule.entries:
+                gr = replicas[e.replica_id][e.local_rank]
+                lines.append(
+                    f"  {e.step:>6}  {e.replica_id:>7}  {e.local_rank:>5}  "
+                    f"{gr:>6}  {e.location}"
+                )
+        else:
+            lines.append("  (no failures scheduled)")
+
+        lines.append("--- schedule YAML (begin) ---")
+        for yl in self.schedule.to_yaml_str().rstrip("\n").splitlines():
+            lines.append(f"  {yl}")
+        lines.append("--- schedule YAML (end) ---")
+        lines.append(sep)
+        return "\n".join(lines)
+
+    def _log_schedule_banner(self, replicas) -> None:
+        """Emit the full schedule dump to the stdlib logger at INFO.
+
+        Call sites that use a different logger (loguru, nanotron log_rank)
+        should additionally call ``describe()`` and log the return value via
+        their own logger so the schedule appears in the expected output stream.
+        """
+        for line in self.describe().splitlines():
+            logger.info("%s", line)
+
+    def _warn_unregistered_locations(self) -> None:
+        scheduled = {e.location for e in self.schedule.entries}
+        missing = scheduled - self._registered_locations
+        if missing:
+            logger.warning(
+                "FailureSimulator: scheduled locations not yet registered: %s "
+                "(decorators register at import; may_fail_here registers on first "
+                "__enter__ — this warning may be premature for the latter)",
+                sorted(missing),
+            )
+
+    def check(self, location: str) -> bool:
+        """If this rank is armed for ``location`` at the current step, SIGKILL.
+
+        Returns False when no failure is injected. When a failure is injected,
+        the process is killed and control never returns.
+        """
+        with self._lock:
+            armed = self._state.armed_entry
+            if armed is None or armed.location != location:
+                return False
+            self._inject(armed)
+            return True  # unreachable
+
+    def _inject(self, entry: FailureEntry) -> None:
+        """Record and SIGKILL. Caller must hold ``self._lock``."""
+        self._history.append(
+            FailureRecord(
+                location=entry.location,
+                rank=self._state.rank,
+                step=entry.step,
+            )
+        )
+        self._has_failed = True
+        logger.warning(
+            "[Rank %d] INJECTING FAILURE at location=%s step=%d (replica=%d, local_rank=%d)",
+            self._state.rank,
+            entry.location,
+            entry.step,
+            entry.replica_id,
+            entry.local_rank,
+        )
+        os.kill(os.getpid(), signal.SIGKILL)
+
+    # ------------------------------------------------------------------
+    # Introspection
+    # ------------------------------------------------------------------
 
     @property
     def has_failed(self) -> bool:
-        """Whether this rank has already failed."""
         with self._lock:
             return self._has_failed
 
-    def get_stats(self) -> dict:
-        """
-        Get failure statistics.
+    @property
+    def my_entries(self) -> Dict[int, FailureEntry]:
+        with self._lock:
+            return dict(self._my_entries)
 
-        Returns:
-            Dictionary with configuration and history.
-        """
+    def get_stats(self) -> Dict:
         with self._lock:
             return {
-                "desired_failures": self.desired_failures,
-                "total_minibatches": self.total_minibatches,
-                "failure_probability": self._failure_probability,
-                "registered_locations": list(self._registered_locations),
-                "config_locations": self._config_locations,
-                "active_weights": self._get_active_locations_with_weights(),
+                "parallelism": self.schedule.parallelism.to_dict(),
+                "generator_config": (
+                    self.schedule.generator_config.to_dict()
+                    if self.schedule.generator_config is not None
+                    else None
+                ),
+                "num_scheduled_entries": len(self.schedule.entries),
+                "my_entries": [
+                    {
+                        "step": e.step,
+                        "replica_id": e.replica_id,
+                        "local_rank": e.local_rank,
+                        "location": e.location,
+                    }
+                    for e in sorted(self._my_entries.values(), key=lambda e: e.step)
+                ],
+                "registered_locations": sorted(self._registered_locations),
                 "has_failed": self._has_failed,
                 "history": [
                     {
                         "location": r.location,
                         "rank": r.rank,
-                        "minibatch": r.minibatch,
+                        "step": r.step,
                         "timestamp": r.timestamp,
                     }
                     for r in self._history
@@ -533,49 +353,45 @@ class FailureSimulator:
             }
 
     def reset(self) -> None:
-        """
-        Reset simulator for a new run.
-
-        Clears failure history and resets RNG. Useful for running
-        multiple test scenarios with the same simulator instance.
-        Note: registered locations are preserved.
-        """
+        """Re-resolve per-rank entries and clear history. Schedule is unchanged."""
         with self._lock:
             self._has_failed = False
             self._history.clear()
-            self._state.minibatch = 0
-            self._state.should_fail_this_minibatch = False
-            self._state.target_location = None
-            if self._state.rank >= 0:
-                self._rng = random.Random(self.seed + self._state.rank)
-            logger.info(f"[Rank {self._state.rank}] FailureSimulator reset")
+            self._state.step = -1
+            self._state.armed_entry = None
+            if self._initialized and self._state.rank >= 0:
+                rank = self._state.rank
+                world_size = self._state.world_size
+                self._initialized = False
+                self._my_entries = {}
+                self._location_scan_done = False
+                # Release the lock to call initialize (acquires it again).
+        if self._state.rank >= 0 and self._state.world_size >= 0 and not self._initialized:
+            self.initialize(rank=self._state.rank, world_size=self._state.world_size)
 
     def __repr__(self) -> str:
-        active = self._get_active_locations_with_weights()
         return (
-            f"FailureSimulator(seed={self.seed}, desired_failures={self.desired_failures}, "
-            f"total_minibatches={self.total_minibatches}, probability={self._failure_probability:.6f}, "
-            f"target_ranks={self.target_ranks}, active_locations={active}, "
-            f"enabled={self.enabled})"
+            f"FailureSimulator(entries={len(self.schedule.entries)}, "
+            f"rank={self._state.rank}, enabled={self.enabled})"
         )
 
 
-# Global singleton for convenience
+# ----------------------------------------------------------------------
+# Global singleton (kept for backwards compatibility with call sites)
+# ----------------------------------------------------------------------
+
 _simulator: Optional[FailureSimulator] = None
 
 
 def get_failure_simulator() -> Optional[FailureSimulator]:
-    """Get the global failure simulator instance."""
     return _simulator
 
 
-def set_failure_simulator(sim: FailureSimulator) -> None:
-    """Set the global failure simulator instance."""
+def set_failure_simulator(sim: Optional[FailureSimulator]) -> None:
     global _simulator
     _simulator = sim
 
 
 def clear_failure_simulator() -> None:
-    """Clear the global failure simulator instance."""
     global _simulator
     _simulator = None
