@@ -28,6 +28,11 @@ try:
     import ulfm_collectives as ULFM
     from ulfm_collectives.training_manager import ULFMTrainingManager
     from ulfm_collectives.failure_simulator import FailureSimulator, set_failure_simulator
+    from ulfm_collectives.failure import (
+        FailureSchedule,
+        ParallelismSpec,
+        generate as generate_failure_schedule,
+    )
     _ULFM_AVAILABLE = True
 except ImportError:
     _ULFM_AVAILABLE = False
@@ -116,12 +121,51 @@ def parse_args(args):
     parser.add_argument("--beta1", type=float, default=0.0)
     # disable ddp, single_gpu
     parser.add_argument("--single_gpu", default=False, action="store_true")
+    # --------------------------------------------------------------
+    # Failure schedule (deterministic replica-aware).
+    # Flat-DP: each rank is treated as its own replica (shard_size=1).
+    # Either load a pre-generated YAML via --failure_schedule, or generate
+    # inline with --failure_count + --failure_step_range + --failure_locations.
+    # The two are mutually exclusive. If neither is given, no failures are injected.
+    # --------------------------------------------------------------
     parser.add_argument(
-        "--failure_start_step",
+        "--failure_schedule",
+        type=str,
+        default=None,
+        help="Path to a YAML failure schedule (see scripts/generate_failure_schedule.py).",
+    )
+    parser.add_argument(
+        "--failure_count",
         type=int,
         default=0,
-        help="Minibatch index at which the failure simulator begins injecting failures. "
-             "Useful to let training stabilize before testing fault tolerance.",
+        help="Inline generator: number of ranks to kill. 0 disables injection.",
+    )
+    parser.add_argument(
+        "--failure_seed",
+        type=int,
+        default=0,
+        help="Inline generator seed. All ranks must pass the same value.",
+    )
+    parser.add_argument(
+        "--failure_step_range",
+        type=int,
+        nargs=2,
+        default=None,
+        metavar=("START", "END"),
+        help="Inline generator: half-open [START, END) minibatch index range for kills.",
+    )
+    parser.add_argument(
+        "--failure_sampling",
+        choices=("iid", "stratified"),
+        default="stratified",
+        help="Inline generator: step-sampling mode.",
+    )
+    parser.add_argument(
+        "--failure_locations",
+        nargs="+",
+        default=None,
+        metavar="NAME:WEIGHT",
+        help="Inline generator: location:weight pairs (e.g. post-allreduce:1.0).",
     )
 
     args = parser.parse_args(args)
@@ -202,6 +246,62 @@ def evaluate_model(
 
     return total_loss, evaluated_on_tokens
 
+
+def _build_failure_simulator(args, world_size: int):
+    """Return a configured FailureSimulator.
+
+    main.py is flat-DP, so each rank is modeled as its own replica via
+    ParallelismSpec(kind="hsdp", world_size=world_size, shard_size=1). When
+    no failures are requested, returns a simulator with an empty schedule so
+    downstream ``begin_minibatch`` / ``may_fail_here`` calls become no-ops.
+    """
+    spec = ParallelismSpec(kind="hsdp", world_size=world_size, shard_size=1)
+
+    if args.failure_schedule and args.failure_count > 0:
+        raise ValueError(
+            "--failure_schedule and --failure_count are mutually exclusive; "
+            "pick one source for the failure schedule."
+        )
+
+    if args.failure_schedule:
+        schedule = FailureSchedule.load(args.failure_schedule)
+        schedule.assert_matches_topology(spec)
+        return FailureSimulator(schedule=schedule)
+
+    if args.failure_count <= 0:
+        empty = FailureSchedule(parallelism=spec, generator_config=None, entries=())
+        return FailureSimulator(schedule=empty, enabled=False)
+
+    if args.failure_step_range is None:
+        raise ValueError(
+            "--failure_count > 0 requires --failure_step_range START END."
+        )
+    if not args.failure_locations:
+        raise ValueError(
+            "--failure_count > 0 requires --failure_locations NAME:WEIGHT ..."
+        )
+
+    weights = {}
+    for item in args.failure_locations:
+        if ":" not in item:
+            raise ValueError(
+                f"--failure_locations entry {item!r} must be NAME:WEIGHT."
+            )
+        name, weight = item.rsplit(":", 1)
+        weights[name] = float(weight)
+
+    start, end = args.failure_step_range
+    schedule = generate_failure_schedule(
+        parallelism=spec,
+        seed=args.failure_seed,
+        num_failures=args.failure_count,
+        step_range=(start, end),
+        location_weights=weights,
+        sampling=args.failure_sampling,
+    )
+    return FailureSimulator(schedule=schedule)
+
+
 def main(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -228,16 +328,13 @@ def main(args):
     device = f"cuda:{local_rank}"
 
     if _ULFM_AVAILABLE and not args.single_gpu:
-        sim = FailureSimulator(
-            seed=42,
-            desired_failures=0,
-            total_minibatches=100 * args.gradient_accumulation,
-            target_ranks={},
-            config_path=None,
-            start_minibatch=args.failure_start_step,
-        )
-        set_failure_simulator(sim)
-        sim.initialize(rank=global_rank, world_size=world_size)
+        sim = _build_failure_simulator(args, world_size=world_size)
+        if sim is not None:
+            if global_rank == 0:
+                for _line in sim.describe().splitlines():
+                    logger.info(_line)
+            set_failure_simulator(sim)
+            sim.initialize(rank=global_rank, world_size=world_size)
     else:
         sim = None
 
