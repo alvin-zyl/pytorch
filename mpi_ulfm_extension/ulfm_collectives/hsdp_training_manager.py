@@ -90,7 +90,7 @@ class HSDPULFMTrainingManager(ULFMTrainingManager):
 
     def train_step(self, batch_idx, data, target, criterion, optimizer, scaler=None):
         """Reset per-step unit counter, then delegate to the parent."""
-
+        self._hook_state.reset_unit_counter()
         self.txn.update_progress(
             microbatch_idx=self._micro_in_window,
             total_microbatches=self._get_grad_accum_steps(),
