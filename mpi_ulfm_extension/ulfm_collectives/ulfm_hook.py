@@ -99,8 +99,6 @@ def create_ulfm_recovery_hook(ulfm_opts: ULFM.ULFMOptions = None):
             return fut
 
         # 2) Snapshot the entire bucket buffer (pre-reduce)
-
-        # 3) Snapshot the entire bucket buffer (pre-reduce)
         logger.debug(
             f"[Rank {orch._rank}] Snapshotting bucket {bucket_index} before allreduce"
         )
