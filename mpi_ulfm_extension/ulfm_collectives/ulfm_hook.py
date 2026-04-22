@@ -146,18 +146,26 @@ def create_ulfm_deferred_hook(ulfm_opts: ULFM.ULFMOptions = None):
     Create a deferred ULFM communication hook for pipeline-parallel training.
 
     The hook fires during the last microbatch's backward pass (per DDP bucketing)
-    but does NOT submit MPI work.  Instead it:
+    and submits the ULFM allreduce immediately, but queues the returned Work
+    for completion handling post-pipeline. Steps:
       1. Snapshots the bucket buffer (for failure restoration)
-      2. Queues the bucket reference on the orchestrator's deferred list
-      3. Returns an immediately-resolved Future so finalize_backward never blocks
+      2. Fires `ulfm_allreduce` async on the bucket buffer
+      3. Queues the in-flight Work on the orchestrator's deferred list
+      4. Returns an immediately-resolved Future so finalize_backward never blocks
 
-    The actual ULFM allreduce is fired later via
-    ``orchestrator.fire_deferred_allreduces()`` after the pipeline stage and
-    replica-consistency gate complete.
+    The Work is drained later via ``orchestrator.fire_deferred_allreduces()``
+    after the pipeline stage and replica-consistency gate complete — that call
+    waits on each Work and runs `handle_work_completion` for failure detection.
+
+    Overlap: allreduce-for-bucket-N runs concurrently with backward for
+    subsequent buckets and with PP grad send/recv (different process groups
+    and streams, logically independent).
 
     Returns:
         Callable hook compatible with DDP.register_comm_hook()
     """
+    opts = torch.distributed.AllreduceOptions()
+    opts.reduceOp = torch.distributed.ReduceOp.SUM
     ulfm_opts = ulfm_opts if ulfm_opts is not None else ULFM.ULFMOptions()
 
     def hook(hstate: HookState, bucket: dist.GradBucket):
@@ -184,23 +192,25 @@ def create_ulfm_deferred_hook(ulfm_opts: ULFM.ULFMOptions = None):
         # no cuda.synchronize needed here)
         orch.on_bucket_snapshot(bucket.buffer(), bucket_index, pg)
 
-        # Queue for deferred allreduce (fired after PP completes)
-        orch.queue_deferred_bucket(bucket.buffer(), bucket_index)
+        _sim = get_failure_simulator()
+        ctx = _sim.may_fail_here("post-deferred-hook-firing") if _sim is not None else contextlib.nullcontext()
+        with ctx:
+        # Fire allreduce async; wait + failure handling happen post-pipeline
+        # in orchestrator.fire_deferred_allreduces().
+            work = pg.ulfm_allreduce([bucket.buffer()], opts, ulfm_opts)
+        orch.queue_deferred_bucket(work, bucket.buffer(), bucket_index)
 
         # Return pre-resolved Future with the *same* bucket buffer tensor.
         # finalize_backward's alias check (bucket_view_in.is_alias_of(bucket_view_out))
         # passes → no copy → effectively a no-op.
-        _sim = get_failure_simulator()
-        ctx = _sim.may_fail_here("post-deferred-hook-firing") if _sim is not None else contextlib.nullcontext()
-        with ctx:
-            fut = torch.futures.Future()
-            fut.set_result(bucket.buffer())
-            return fut
+        fut = torch.futures.Future()
+        fut.set_result(bucket.buffer())
+        return fut
 
     return hook
 
 
-def create_ulfm_fp32_deferred_hook(accumulator, param_id_to_name: dict):
+def create_ulfm_fp32_deferred_hook(accumulator, param_id_to_name: dict, ulfm_opts: ULFM.ULFMOptions = None):
     """
     Create a deferred ULFM hook that accumulates bf16 grads into fp32 buffers.
 
@@ -211,17 +221,27 @@ def create_ulfm_fp32_deferred_hook(accumulator, param_id_to_name: dict):
       2. Computes the [min_offset, min_offset+total_numel) slice covering the
          bucket's params and asserts it is gap-free
       3. Snapshots that slice (clone) for failure rollback
-      4. Queues the slice view (aliased to the real accumulator storage) for
-         deferred ULFM allreduce — allreduce lands in place, no scatter-back
-      5. Returns pre-resolved Future (bf16 bucket unchanged for DDP)
+      4. Fires `ulfm_allreduce` async on the fp32 slice view (aliased to the
+         real accumulator storage) — allreduce lands in place, no scatter-back
+      5. Queues the in-flight Work on the orchestrator's deferred list
+      6. Returns pre-resolved Future (bf16 bucket unchanged for DDP)
+
+    The Work is drained post-pipeline via
+    ``orchestrator.fire_deferred_allreduces()`` which waits on each Work and
+    runs failure detection. Firing eagerly in the hook overlaps allreduce-for-
+    bucket-N with backward for subsequent buckets and with PP grad send/recv.
 
     Args:
         accumulator: FP32GradientAccumulator instance
         param_id_to_name: dict mapping id(param) → param name in accumulator
+        ulfm_opts: ULFM options used for each allreduce submission
 
     Returns:
         Callable hook compatible with DDP.register_comm_hook()
     """
+    opts = torch.distributed.AllreduceOptions()
+    opts.reduceOp = torch.distributed.ReduceOp.SUM
+    ulfm_opts = ulfm_opts if ulfm_opts is not None else ULFM.ULFMOptions()
 
     def hook(hstate: HookState, bucket: dist.GradBucket):
         pg = hstate.pg
@@ -280,9 +300,11 @@ def create_ulfm_fp32_deferred_hook(accumulator, param_id_to_name: dict):
         #    the accumulator's real storage since bucket_slice aliases it)
         orch.on_bucket_snapshot(bucket_slice, bucket_index, pg)
 
-        # 4. Queue the slice view for deferred allreduce — ULFM allreduce lands
-        #    in place in _contiguous_fp32_grad_buffer via this view. No scatter-back.
-        orch.queue_deferred_bucket(bucket_slice, bucket_index)
+        # 4. Fire allreduce async on the fp32 slice. The allreduce lands in
+        #    place in _contiguous_fp32_grad_buffer via this view; wait +
+        #    failure handling happen in orchestrator.fire_deferred_allreduces().
+        work = pg.ulfm_allreduce([bucket_slice], opts, ulfm_opts)
+        orch.queue_deferred_bucket(work, bucket_slice, bucket_index)
 
         # 5. Return pre-resolved Future (bf16 bucket unchanged for DDP)
         _sim = get_failure_simulator()

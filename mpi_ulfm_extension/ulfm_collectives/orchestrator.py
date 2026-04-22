@@ -84,9 +84,12 @@ class StepTxnOrchestrator:
         # Hook invocation counter (used to detect gradient corruption)
         self._hook_invocation_counter = 0
 
-        # Deferred bucket queue: populated by the deferred hook during backward,
-        # fired after the pipeline stage completes via fire_deferred_allreduces().
-        self._deferred_buckets: List[Tuple[torch.Tensor, int]] = []
+        # Deferred bucket queue: populated by the deferred hook during backward.
+        # Each entry is (work, buffer, bucket_index) — the hook fires the
+        # ulfm_allreduce eagerly and queues the in-flight Work so that
+        # fire_deferred_allreduces() can wait on it post-pipeline and run
+        # failure handling.
+        self._deferred_buckets: List[Tuple["ULFM.WorkULFM", torch.Tensor, int]] = []
 
         # Training progression (microbatch index / total in accumulation window / macrobatch index)
         self._current_microbatch_idx = 0
@@ -762,41 +765,46 @@ class StepTxnOrchestrator:
     # Deferred bucket allreduce (for pipeline-parallel training)
     # ------------------------------------------------------------------ #
 
-    def queue_deferred_bucket(self, buffer: torch.Tensor, bucket_index: int) -> None:
-        """Queue a bucket for deferred allreduce (called by deferred hook)."""
-        self._deferred_buckets.append((buffer, bucket_index))
+    def queue_deferred_bucket(
+        self,
+        work: "ULFM.WorkULFM",
+        buffer: torch.Tensor,
+        bucket_index: int,
+    ) -> None:
+        """Queue an in-flight ulfm_allreduce Work for drain-time completion.
+
+        Called by the deferred hook after it submits the allreduce async.
+        """
+        self._deferred_buckets.append((work, buffer, bucket_index))
         logger.debug(
-            f"[Rank {self._rank}] Queued deferred bucket {bucket_index} "
+            f"[Rank {self._rank}] Queued in-flight allreduce for bucket {bucket_index} "
             f"(total queued: {len(self._deferred_buckets)})"
         )
 
     def fire_deferred_allreduces(self) -> bool:
         """
-        Fire all deferred bucket allreduces.
+        Drain all in-flight deferred bucket allreduces.
 
-        Call after the pipeline stage and replica-consistency gate complete.
-        Each queued buffer is allreduced in-place via ULFM. For the fp32
-        accumulator path, the queued buffer is a view into the accumulator's
-        _contiguous_fp32_grad_buffer, so the allreduce result lands directly
+        Each deferred hook invocation fires a ulfm_allreduce eagerly and queues
+        the Work. This method waits on each Work post-pipeline and runs
+        handle_work_completion for success accounting and failure detection.
+
+        For the fp32 accumulator path, the allreduce targets a view into the
+        accumulator's _contiguous_fp32_grad_buffer so the result lands directly
         in the accumulator storage — no scatter-back.
 
         Returns True if all buckets succeeded, False if any failure occurred.
         """
         if not self._deferred_buckets:
-            logger.debug(f"[Rank {self._rank}] No deferred buckets to allreduce")
+            logger.debug(f"[Rank {self._rank}] No in-flight allreduces to drain")
             return True
 
-        opts = torch.distributed.AllreduceOptions()
-        opts.reduceOp = torch.distributed.ReduceOp.SUM
-        ulfm_opts = self._ulfm_opts
-
         logger.debug(
-            f"[Rank {self._rank}] Firing {len(self._deferred_buckets)} deferred allreduces"
+            f"[Rank {self._rank}] Draining {len(self._deferred_buckets)} in-flight allreduces"
         )
 
         any_failure = False
-        for buffer, bucket_index in self._deferred_buckets:
-            work = self.dp_pg.ulfm_allreduce([buffer], opts=opts, ulfm_opts=ulfm_opts)
+        for work, _buffer, bucket_index in self._deferred_buckets:
             work.wait()
 
             _sim = get_failure_simulator()
