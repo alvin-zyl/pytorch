@@ -739,9 +739,8 @@ def _post_backward_hook(
         if not state._sync_gradients:
             # Hybrid-with-hook (ULFM) path: fall through so _reduce_grad runs
             # reduce_scatter and accumulates into _saved_grad_shard every
-            # microstep, while deferring the cross-replica hook until the final
-            # sync step. One MPI allreduce per accumulation window on an fp32
-            # sharded accumulator, no extra buffers.
+            # microstep. The cross-replica allreduce is deferred to AFTER
+            # backward returns (driven externally by HSDPULFMTrainingManager).
             uses_hybrid_hook = (
                 handle._sharding_strategy
                 in (
@@ -859,15 +858,21 @@ def _reduce_grad(state: _FSDPState, handle: FlatParamHandle) -> None:
         state, unsharded_grad
     )
     if uses_hybrid_sharded_strategy and state._comm_hook is not None:
-        # Hybrid-with-hook path: reduce_scatter intra-replica every microstep;
-        # the registered hook (cross-replica MPI) fires only on the sync step,
-        # and its returned future / accumulation is deferred to
-        # _post_backward_final_callback so MPI-backed hooks don't block the
-        # autograd thread. Under gradient accumulation (no_sync), we skip the
-        # hook and fold the per-step shard into _saved_grad_shard locally; on
-        # the final sync step we fold first, then fire MPI on the accumulated
-        # shard. Net: one MPI allreduce per window on an fp32 sharded
-        # accumulator, no extra buffers.
+        # Hybrid-with-hook (ULFM) path. Mirrors nanotron's deferred-hook
+        # pattern: hook still fires (for snapshot + queue), but does NO MPI.
+        #  1. reduce_scatter intra-replica → new_sharded_grad
+        #  2. postdivide
+        #  3. _accumulate_sharded_grad → _saved_grad_shard now holds the
+        #     running local-shard sum across all microsteps in this window
+        #  4. On sync step only: fire the deferred hook on _saved_grad_shard.
+        #     The hook snapshots + queues + returns a pre-resolved Future
+        #     (see create_ulfm_hsdp_hook). NO MPI traffic happens during
+        #     backward.
+        #  5. _post_reduce_grad_callback (offload + sharded grad views)
+        # The actual cross-replica allreduce is fired by
+        # HSDPULFMTrainingManager._fire_cross_replica_allreduces() AFTER
+        # backward returns (drains the orchestrator's queue), avoiding any
+        # overlap with shard_pg's NCCL ops.
         _div_if_needed(padded_unsharded_grad, state._gradient_predivide_factor)
         pg = (
             handle._fake_process_group
@@ -879,38 +884,14 @@ def _reduce_grad(state: _FSDPState, handle: FlatParamHandle) -> None:
             padded_unsharded_grad,
             group=pg,
         )
-        if not state._sync_gradients:
-            # no_sync microstep: accumulate locally, no cross-replica allreduce.
-            _div_if_needed(new_sharded_grad, state._gradient_postdivide_factor)
-            grad_to_offload = _accumulate_sharded_grad(
-                state, handle, new_sharded_grad
-            )
-            _post_reduce_grad_callback(state, handle, grad_to_offload)
-            return
-        if not torch.distributed._functional_collectives.is_torchdynamo_compiling():
-            state._all_reduce_stream.wait_stream(state._post_backward_stream)
-        with state._device_handle.stream(state._all_reduce_stream):
-            _no_dispatch_record_stream(new_sharded_grad, state._all_reduce_stream)
-            saved = getattr(flat_param, "_saved_grad_shard", None)
-            if saved is not None:
-                # Fold this step's shard into the accumulator (matching the
-                # postdivide applied by the no_sync branch), then zero
-                # new_sharded_grad so the deferred _accumulate_sharded_grad
-                # is a += 0 no-op after MPI returns.
-                _div_if_needed(new_sharded_grad, state._gradient_postdivide_factor)
-                saved.add_(new_sharded_grad)
-                new_sharded_grad.zero_()
-                hook_input = saved
-            else:
-                # grad_accum == 1: no accumulator yet. Drain applies postdivide
-                # after MPI returns, same as before.
-                hook_input = new_sharded_grad
-            fut = state._comm_hook(state._comm_hook_state, hook_input)
-        pending = getattr(state, "_pending_cross_replica", None)
-        if pending is None:
-            pending = []
-            state._pending_cross_replica = pending
-        pending.append((fut, handle, new_sharded_grad))
+        _div_if_needed(new_sharded_grad, state._gradient_postdivide_factor)
+        grad_to_offload = _accumulate_sharded_grad(state, handle, new_sharded_grad)
+        if state._sync_gradients:
+            # Fire deferred hook on the accumulated shard. Returned Future is
+            # pre-resolved — discard. The hook has already snapshotted and
+            # queued the buffer reference for later cross-replica allreduce.
+            state._comm_hook(state._comm_hook_state, flat_param._saved_grad_shard)
+        _post_reduce_grad_callback(state, handle, grad_to_offload)
         return
     if state._comm_hook is None:  # default path
         _div_if_needed(padded_unsharded_grad, state._gradient_predivide_factor)

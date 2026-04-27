@@ -44,6 +44,7 @@ try:
         replicate_peer_ranks,
     )
     from ulfm_collectives.hsdp_training_manager import HSDPULFMTrainingManager
+    from ulfm_collectives.policy import GradRestoreMode
     _ULFM_AVAILABLE = True
 except ImportError:
     _ULFM_AVAILABLE = False
@@ -521,9 +522,23 @@ def main(args):
         == args.total_batch_size
     ), "gradient_accumulation * batch_size * world_size must be equal to total_batch_size"
 
-    # turn off logger
+    # Loguru is used for script-level messages (loss / update step). Silence
+    # it on non-rank-0 so the "Update step / loss" line only prints once.
     if global_rank != 0:
         logger.remove()
+
+    # Stdlib logging is used by ulfm_collectives (orchestrator,
+    # training_manager, hooks). Configure the root logger on EVERY rank with
+    # an INFO-level StreamHandler so messages like "Restore completed",
+    # "Communicator repaired", etc. surface from every rank that emits them.
+    # Without this, stdlib's lastResort handler suppresses everything below
+    # WARNING. --ulfm_verbose later may further bump ulfm_collectives to DEBUG.
+    import logging as _logging
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format=f"%(asctime)s [%(levelname)s|rank{global_rank}] %(name)s: %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+    )
 
     if global_rank == 0:
         model_name = args.model_config.split("/")[1]
@@ -767,6 +782,7 @@ def main(args):
         training_manager = HSDPULFMTrainingManager(
             fsdp_model=model,
             replicate_pg=replicate_pg,
+            world_pg=world_pg,
             grad_accum_steps=args.gradient_accumulation,
             policy_type="static",
             initial_world_size=hsdp_layout.num_replicas,
@@ -792,36 +808,60 @@ def main(args):
     if global_rank == 0:
         print(f"Rank {global_rank} starting training loop.")
 
-    stepped = False
-    for batch_idx, batch in enumerate(train_dataloader):
-        if batch_idx // args.gradient_accumulation < update_step:
-            # Skipping data that are already seen in previous steps
-            continue
-
-        global_step += 1
-        local_step += 1
-
-        if update_step > args.num_training_steps:
-            logger.info(
-                f"Reached max number of update steps (f{args.num_training_steps}). Stopping training."
-            )
-            if global_rank == 0:
-                print(f"Stopping training.")
-            break
+    # Helper: bring a microbatch to device, set labels, count tokens.
+    def _prepare_batch(batch):
         batch = {k: v.to(device) for k, v in batch.items()}
         batch["labels"] = (
             batch["input_ids"].clone() if "labels" not in batch else batch["labels"]
         )
         batch["labels"][batch["labels"] == pad_idx] = -100
-        tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
+        return batch
 
-        if args.single_gpu:
-            loss = model(**batch).loss
-            scaled_loss = loss / args.gradient_accumulation
-            scaled_loss.backward()
-            if global_step % args.gradient_accumulation != 0:
-                continue
-            stepped = True
+    # Outer loop is per UPDATE STEP; inner loop is gradient accumulation.
+    # For ULFM, the inner microbatch loop is wrapped by a restore-mode loop
+    # that may run extra microbatches at a policy boundary (mirrors nanotron).
+    data_iter = iter(train_dataloader)
+    batch_idx = -1  # cumulative microbatch counter (matches old `batch_idx`)
+
+    # Resume: skip microbatches already seen in earlier update_steps.
+    if update_step > 0:
+        batches_to_skip = update_step * args.gradient_accumulation
+        for _ in range(batches_to_skip):
+            try:
+                next(data_iter)
+                batch_idx += 1
+            except StopIteration:
+                break
+
+    while update_step < args.num_training_steps:
+        # ============================================================
+        # Single-GPU / NCCL backend: simple inner microbatch loop
+        # ============================================================
+        if args.single_gpu or args.backend == "nccl":
+            loss = None
+            data_exhausted = False
+            for micro_idx in range(args.gradient_accumulation):
+                try:
+                    raw_batch = next(data_iter)
+                except StopIteration:
+                    data_exhausted = True
+                    break
+                batch_idx += 1
+                global_step += 1
+                local_step += 1
+                batch = _prepare_batch(raw_batch)
+                tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
+
+                if args.single_gpu:
+                    loss = model(**batch).loss
+                else:
+                    loss = model(batch).loss
+                scaled_loss = loss / args.gradient_accumulation
+                scaled_loss.backward()
+
+            if data_exhausted:
+                break
+
             if args.grad_clipping != 0.0:
                 torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping)
             grad_norm = sum(
@@ -834,39 +874,103 @@ def main(args):
             if not layer_wise_flag:
                 optimizer.step()
                 optimizer.zero_grad()
-        elif args.backend == "nccl":
-            loss = model(batch).loss
-            scaled_loss = loss / args.gradient_accumulation
-            scaled_loss.backward()
-            if global_step % args.gradient_accumulation != 0:
-                continue
-            stepped = True
-            if args.grad_clipping != 0.0:
-                torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping)
-            grad_norm = sum(
-                [
-                    torch.norm(p.grad.clone().detach().cpu())
-                    for p in model.parameters()
-                    if p.grad is not None
-                ]
-            )
-            if not layer_wise_flag:
-                optimizer.step()
-                optimizer.zero_grad()
+
+        # ============================================================
+        # ULFM backend: nanotron-style restore-mode loop around the
+        # microbatch loop. On failure, query orchestrator for extra
+        # microbatches and run another pass before optimizer step.
+        # ============================================================
         else:
-            if world_pg is not None:
-                ulfm_opts = ULFM.ULFMOptions(auto_repair=True)
-                work = world_pg.consensus(ulfm_opts)
-                work.wait()
-            
-            sim.begin_minibatch(batch_idx)
-            with sim.may_fail_here("pre-forward"):
-                loss, stepped, grad_norm = training_manager.train_step(
-                    batch_idx, batch, None, lm_criterion, optimizer,
-                    grad_clipping=args.grad_clipping,
+            is_first_pass = True
+            loss = None
+            data_exhausted = False
+
+            while True:
+                if is_first_pass:
+                    n_micro = training_manager.get_effective_n_microbatches()
+                else:
+                    n_micro = training_manager.get_n_extra_microbatches()
+
+                training_manager.prepare_iteration(is_first_pass=is_first_pass)
+                training_manager.on_world_consensus()
+
+                # Inner microbatch loop (forward + backward only)
+                for micro_idx in range(n_micro):
+                    try:
+                        raw_batch = next(data_iter)
+                    except StopIteration:
+                        data_exhausted = True
+                        break
+                    batch_idx += 1
+                    global_step += 1
+                    local_step += 1
+                    batch = _prepare_batch(raw_batch)
+                    tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
+
+                    # Extended pass: wait for non-blocking restore before the
+                    # first microbatch's backward.
+                    if not is_first_pass and micro_idx == 0:
+                        training_manager.wait_restore_before_backward()
+
+                    sim.begin_minibatch(batch_idx)
+                    with sim.may_fail_here("pre-forward"):
+                        loss = training_manager.microbatch_step(
+                            batch_idx, micro_idx, n_micro,
+                            batch, None, lm_criterion,
+                        )
+
+                if data_exhausted:
+                    break
+
+                is_first_pass = False
+
+                # Cross-replica allreduce on each FSDP unit's grad shard.
+                training_manager.fire_cross_replica_allreduces()
+                # Intra-replica barrier: ensure all shard-mates within a
+                # replica observe the same outcome of the cross-replica
+                # reduce before consensus / restore-mode dispatch. NCCL
+                # collective on shard_pg, no MPI traffic.
+                if shard_pg is not None:
+                    dist.barrier(group=shard_pg)
+                training_manager.on_consensus_step()
+
+                mode = training_manager.get_restore_mode()
+                if mode == GradRestoreMode.SKIP:
+                    break  # success, proceed to optimizer step
+                if mode == GradRestoreMode.NON_BLOCKING:
+                    # Policy boundary: async restore + extra microbatches.
+                    training_manager.start_nonblocking_restore()
+                    continue
+
+                # BLOCKING: blocking restore (re-reduce) loop
+                crossed_boundary = False
+                blocking_attempts = 0
+                while training_manager.get_restore_mode() == GradRestoreMode.BLOCKING:
+                    training_manager.start_blocking_restore()
+                    blocking_attempts += 1
+                    if training_manager.is_at_policy_boundary():
+                        training_manager.start_nonblocking_restore()
+                        crossed_boundary = True
+                        break
+                    if blocking_attempts > 3:
+                        raise RuntimeError(
+                            f"[Rank {global_rank}] Blocking restore retry limit exceeded"
+                        )
+                if crossed_boundary:
+                    continue  # outer: run extra microbatches
+                break  # restored without crossing boundary, proceed
+
+            if data_exhausted:
+                break
+
+            # Post-loop: normalize, clip, optimizer step
+            training_manager.normalize_gradients()
+            if args.grad_clipping != 0.0:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), args.grad_clipping
                 )
-            if not stepped:
-                continue
+            grad_norm = training_manager.compute_grad_norm()
+            training_manager.optimizer_step(optimizer)
 
         if global_rank == 0:
             logger.info(

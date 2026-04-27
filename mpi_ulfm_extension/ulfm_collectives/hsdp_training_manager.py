@@ -39,6 +39,7 @@ class HSDPULFMTrainingManager(ULFMTrainingManager):
         self,
         fsdp_model,
         replicate_pg,
+        world_pg: "ULFM.ProcessGroupULFM" = None,
         grad_accum_steps: int = 1,
         policy_type: str = "static",
         **policy_kwargs,
@@ -51,8 +52,9 @@ class HSDPULFMTrainingManager(ULFMTrainingManager):
         self.failure_strategy = "continue"
         self.process_group = replicate_pg
         # Derived world PG (sibling of replicate_pg / shard_pg, all rooted at
-        # MPI_COMM_WORLD), mirroring nanotron's ParallelContext.world_pg.
-        # Falls back to dist.group.WORLD (the default group) when not provided.
+        # MPI_COMM_WORLD), mirroring nanotron's ParallelContext.world_pg. Used
+        # by on_world_consensus(); None disables that step.
+        self.world_pg = world_pg
 
         policy = create_policy(
             policy_type=policy_type,
@@ -113,137 +115,165 @@ class HSDPULFMTrainingManager(ULFMTrainingManager):
             state._gradient_postdivide_factor = float(shard_size)
 
     def _register_ulfm_hook(self, ulfm_opts):
-        """Register the FSDP-shaped ULFM hook on the FSDP model."""
+        """Register the FSDP-shaped deferred ULFM hook.
+
+        The hook fires on the sync microstep with ``flat_param._saved_grad_shard``
+        (the local-shard accumulator). It snapshots + queues the buffer on the
+        orchestrator and returns a pre-resolved Future — NO MPI is issued
+        during backward. ``_fire_cross_replica_allreduces`` later drains the
+        orchestrator's queue and does the actual ULFM allreduces.
+        """
         hook = create_ulfm_hsdp_hook(ulfm_opts=ulfm_opts)
         self.ddp_model.register_comm_hook(state=self._hook_state, hook=hook)
         logger.debug(
-            f"[Rank {self.txn._rank}] HSDP ULFM hook registered on replicate_pg"
+            f"[Rank {self.txn._rank}] HSDP deferred ULFM hook registered on replicate_pg"
         )
         self._hook = hook
 
-    def train_step(self, batch_idx, data, target, criterion, optimizer, scaler=None, grad_clipping: float = 0.0):
-        """Reset per-step unit counter, then delegate to the parent."""
+    def _fire_cross_replica_allreduces(self) -> None:
+        """Drain the orchestrator's deferred-bucket queue: for each queued
+        ``_saved_grad_shard`` (snapshotted + queued by the hook during
+        backward's sync microstep), fire ULFM allreduce, wait, and run
+        ``handle_work_completion`` (which also runs the failure-injection
+        ``may_fail_here("post-allreduce")``).
+
+        Mirrors nanotron's pattern: hook fires during backward but does NO
+        MPI; this method runs AFTER backward and does all MPI sequentially.
+        No overlap with shard_pg's NCCL ops → no CUDA-aware MPI starvation.
+        """
+        self.txn.fire_deferred_allreduces()
+
+    # ------------------------------------------------------------------
+    # Loop-driven API (mirrors NanotronULFMTrainingManager). The trainer
+    # (main_hsdp.py) drives the outer iteration / inner microbatch loops,
+    # the per-iteration restore-mode dispatch, optimizer step, and grad
+    # clipping. The manager exposes microbatch_step + query/action helpers.
+    # ------------------------------------------------------------------
+
+    # ---- Query methods ----
+
+    def get_effective_n_microbatches(self) -> int:
+        """Microbatches for the first pass of an iteration (policy-current grad_accum)."""
+        return self.txn.curr_grad_accum_steps
+
+    def get_n_extra_microbatches(self) -> int:
+        """Microbatches for an extended pass at a policy boundary."""
+        return self.txn.num_policy_boundary_steps
+
+    def get_restore_mode(self) -> GradRestoreMode:
+        return self._get_restore_mode()
+
+    def is_at_policy_boundary(self) -> bool:
+        return self.txn.at_policy_boundary
+
+    # ---- Lifecycle ----
+
+    def prepare_iteration(self, is_first_pass: bool) -> None:
+        """Called once at the start of an iteration pass (first or extended)."""
+        if is_first_pass:
+            self._notify_window_start()
+        self._on_grad_sync_step()
         self._hook_state.reset_unit_counter()
+
+    def on_world_consensus(self) -> None:
+        """Global ULFM consensus on world_pg (kept for parity with nanotron)."""
+        if self.world_pg is None:
+            return
+        ulfm_opts = ULFM.ULFMOptions(auto_repair=True)
+        work = self.world_pg.consensus(ulfm_opts)
+        work.wait()
+
+    def on_consensus_step(self) -> None:
+        """Cross-DP consensus barrier; clears quiesce on success."""
+        self._on_consensus_step()
+
+    # ---- Microbatch step (forward + backward only) ----
+
+    def microbatch_step(
+        self,
+        batch_idx: int,
+        micro_idx: int,
+        n_micro: int,
+        data,
+        target,
+        criterion,
+        scaler=None,
+    ):
+        """Run one microbatch's forward + backward. The trainer drives the
+        per-iteration loop, so this method does NOT touch the optimizer or
+        the cross-replica reduce. The last microstep (micro_idx == n_micro-1)
+        runs in sync mode (FSDP _reduce_grad runs intra-shard reduce_scatter
+        + accumulates into _saved_grad_shard); earlier microsteps run under
+        no_sync (still reduce_scatter+accumulate after the fp32-fold patch,
+        but no autograd-side reshard wait).
+        """
         self.txn.update_progress(
-            microbatch_idx=self._micro_in_window,
-            total_microbatches=self._get_grad_accum_steps(),
+            microbatch_idx=micro_idx,
+            total_microbatches=n_micro,
             macrobatch_idx=batch_idx,
         )
-
-        # === Window start: initialize ===
-        if self._micro_in_window == 0:
-            # Notify policy of window start
-            self._notify_window_start()
-
-            # Zero gradients at start of window
-            optimizer.zero_grad(set_to_none=False)
-
-        # === Check if orchestrator flagged need for restoration (set by hook) ===
-        # If at policy boundary: use non-blocking restoration during forward
-        # (This flag is set by hook when policy.on_failure() returns at_iteration_boundary=True)
-        restore_mode = self._get_restore_mode()
-
-        if restore_mode == GradRestoreMode.NON_BLOCKING:
-            # At policy boundary: Start async restoration during forward
-            logger.info(
-                f"[Rank {self.txn._rank}] At policy boundary - starting non-blocking grad restoration"
-            )
-            self._start_restore_gradients_non_blocking()
-
-        # === Backward (use no_sync on non-last microbatches) ===
-        if self._is_at_grad_sync_step:
+        is_last = (micro_idx == n_micro - 1)
+        if is_last:
             ctx = contextlib.nullcontext()
             self._on_grad_sync_step()
         else:
             ctx = self.ddp_model.no_sync()
 
         with ctx:
-            logger.debug(
-                f"[Rank {self.txn._rank}] Backward pass at microbatch {self._micro_in_window} "
-                f"no_sync={not self._is_at_grad_sync_step}"
-            )
-            # === Forward ===
             output = self.ddp_model(data)
-
-            # === Wait for async restoration if it was started ===
-            if restore_mode == GradRestoreMode.NON_BLOCKING:
-                self._wait_restore_before_backward()
-                logger.debug(
-                    f"[Rank {self.txn._rank}] Non-blocking restoration completed before backward"
-                )
-
             loss = self._may_zero_grad(criterion(output, target))
             if scaler is None:
                 loss.backward()
             else:
                 scaler.scale(loss).backward()
 
-        # === After backward: check with policy if we should commit ===
-        state = self._on_microbatch_complete(self._micro_in_window)
-        restore_mode = self._get_restore_mode()
-        stepped = False
+        self._on_microbatch_complete(micro_idx)
+        return float(loss.detach())
 
-        # === Decide whether to commit optimizer step ===
-        if state.at_iteration_boundary:
-            logger.debug(
-                f"[Rank {self.txn._rank}] Microbatch index: {self._micro_in_window}, grad_acc_step: {self._get_grad_accum_steps()}, "
-                f"at iteration boundary"
-            )
-            self._on_grad_sync_step()
+    # ---- Cross-replica allreduce (after inner microbatch loop) ----
 
-            # If NOT at policy boundary but need restoration: blocking restore before optimizer
-            if restore_mode == GradRestoreMode.BLOCKING:
-                logger.info(
-                    f"[Rank {self.txn._rank}] Not at policy boundary - blocking grad restoration before optimizer"
-                )
-                self._start_restore_gradients_blocking()
-                logger.debug(f"[Rank {self.txn._rank}] Blocking restoration finished.")
+    def fire_cross_replica_allreduces(self) -> None:
+        """Public entry point — see _fire_cross_replica_allreduces for details."""
+        self._fire_cross_replica_allreduces()
 
-            # Optimizer step
-            if scaler is None:
-                for p in self.ddp_model.parameters():
-                    if p.grad is not None:
-                        p.grad.div_(self._get_grad_div_factor())
-                if grad_clipping != 0.0:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.ddp_model.parameters(), grad_clipping
-                    )
-                grad_norm = self._compute_grad_norm()
-                optimizer.step()
-            else:
-                if hasattr(scaler, "unscale_"):
-                    scaler.unscale_(optimizer)
-                for p in self.ddp_model.parameters():
-                    if p.grad is not None:
-                        p.grad.div_(self._get_grad_div_factor())
-                if grad_clipping != 0.0:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.ddp_model.parameters(), grad_clipping
-                    )
-                grad_norm = self._compute_grad_norm()
-                scaler.step(optimizer)
-                scaler.update()
+    # ---- Restore actions ----
 
-            optimizer.zero_grad(set_to_none=False)
-            stepped = True
+    def start_blocking_restore(self) -> None:
+        self._start_restore_gradients_blocking()
 
-            # Notify orchestrator
-            self._on_step_committed()
+    def start_nonblocking_restore(self) -> None:
+        self._start_restore_gradients_non_blocking()
 
-            # Reset for next window
-            self._micro_in_window = 0
+    def wait_restore_before_backward(self) -> None:
+        self._wait_restore_before_backward()
 
+    # ---- Optimizer-step helpers ----
+
+    def normalize_gradients(self) -> None:
+        """Apply the manager's grad_div_factor to every param.grad in-place."""
+        div = self._get_grad_div_factor()
+        for p in self.ddp_model.parameters():
+            if p.grad is not None:
+                p.grad.div_(div)
+
+    def optimizer_step(self, optimizer, scaler=None) -> None:
+        """Run optimizer.step (with optional scaler), zero_grad, and notify
+        the orchestrator that the step was committed. Caller is responsible
+        for normalize_gradients() and grad clipping BEFORE calling this.
+        """
+        if scaler is None:
+            optimizer.step()
         else:
-            # Not at window boundary: continue accumulation
-            self._micro_in_window += 1
-            grad_norm = 0.0
+            scaler.step(optimizer)
+            scaler.update()
+        optimizer.zero_grad(set_to_none=False)
+        self._on_step_committed()
 
-        return float(loss.detach()), stepped, grad_norm
+    # ---- Diagnostics ----
 
-    def _compute_grad_norm(self) -> float:
-        """Mirror the NCCL baseline's grad_norm: sum of per-param L2 norms on
-        each rank's local shards. Not a true global norm — kept identical to
-        baseline so wandb curves are comparable."""
+    def compute_grad_norm(self) -> float:
+        """Sum of per-param L2 norms on this rank's local shard. Mirrors the
+        NCCL baseline; not a true global norm but comparable across runs."""
         total = 0.0
         for p in self.ddp_model.parameters():
             if p.grad is not None:

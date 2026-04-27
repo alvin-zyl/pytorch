@@ -339,40 +339,48 @@ def create_ulfm_hsdp_hook(ulfm_opts: ULFM.ULFMOptions = None):
     ulfm_opts = ulfm_opts if ulfm_opts is not None else ULFM.ULFMOptions()
 
     def hook(state: HSDPHookState, grad_shard: torch.Tensor):
+        """Deferred hook (mirrors nanotron pattern): snapshot + queue, NO MPI.
+
+        FSDP fires this on the sync microstep with ``flat_param._saved_grad_shard``
+        (the local-shard accumulator across all microsteps in the window).
+        We snapshot it for failure rollback and queue it on the orchestrator's
+        ``_deferred_buckets``. The actual ULFM allreduce is fired later by
+        ``HSDPULFMTrainingManager._fire_cross_replica_allreduces`` →
+        ``txn.fire_deferred_allreduces()``, AFTER backward returns. Returning
+        a pre-resolved Future means FSDP's deferred-drain (if any) is a no-op
+        and no MPI traffic happens during backward.
+        """
         pg = state.pg
         orch = state.orchestrator
         unit_index = state.next_unit_index()
 
         logger.debug(
-            f"[Rank {orch._rank}] HSDP hook entered for unit {unit_index}, "
+            f"[Rank {orch._rank}] HSDP deferred hook entered for unit {unit_index}, "
             f"numel={grad_shard.numel()}, dtype={grad_shard.dtype}"
         )
 
-        # 1) Quiesced? NOOP.
+        # If comm is quiesced from a prior failure: skip snapshot + queue.
+        # No allreduce will run for this unit this step → nothing to roll back.
         if getattr(pg, "is_quiesced", lambda: False)():
             logger.warning(
-                f"[Rank {orch._rank}] replicate_pg quiesced — skipping unit {unit_index}."
+                f"[Rank {orch._rank}] replicate_pg quiesced — skipping snapshot/queue for unit {unit_index}."
             )
             fut = torch.futures.Future()
             fut.set_result(grad_shard)
             return fut
 
-        # 2) Snapshot the bf16 shard grad for restore.
+        # Snapshot the accumulator for restore on failure.
         orch.on_bucket_snapshot(grad_shard, unit_index, pg)
 
-        # 3) Submit ulfm_allreduce on replicate_pg. up/down-cast lives in C++.
-        #    ulfm_allreduce records a CUDA event on the current stream and the
-        #    worker thread blocks on it before MPI, so no Python-side sync here.
-        work = pg.ulfm_allreduce([grad_shard], opts, ulfm_opts)
+        # Queue for deferred ULFM allreduce. The buffer reference here is
+        # _saved_grad_shard, which becomes flat_param.grad after FSDP's
+        # _finalize_params runs at the end of backward — same Python tensor
+        # object, so the queued reference stays valid.
+        orch.queue_deferred_bucket(grad_shard, unit_index)
 
-        def on_done(fut):
-            _sim = get_failure_simulator()
-            ctx = _sim.may_fail_here("post-allreduce") if _sim is not None else contextlib.nullcontext()
-            with ctx:
-                orch.handle_work_completion(work=work, bucket_index=unit_index)
-            orch.increment_hook_counter()
-            return fut.value()[0]
-
-        return work.get_future().then(on_done)
+        # Pre-resolved Future — FSDP's drain will not block on this.
+        fut = torch.futures.Future()
+        fut.set_result(grad_shard)
+        return fut
 
     return hook
