@@ -200,6 +200,15 @@ def parse_args(args):
         help="Inline generator: location:weight pairs (e.g. post-allreduce:0.6 backward:0.4).",
     )
     parser.add_argument(
+        "--ulfm_verbose",
+        default=False,
+        action="store_true",
+        help="Enable verbose ULFM logging: turns on ProcessGroupULFM C++ "
+             "verbose mode (set_ulfm_verbose_logging(True)) and bumps the "
+             "Python 'ulfm_collectives' logger to DEBUG. Mirrors nanotron's "
+             "--ulfm-verbose flag.",
+    )
+    parser.add_argument(
         "--failure_exclude_replicas",
         type=str,
         default="0",
@@ -446,6 +455,16 @@ def main(args):
             shard_size = max(torch.cuda.device_count(), 1)
         else:
             shard_size = args.hsdp_shard_size
+        # Mirror nanotron's ParallelContext: build a derived world_pg via
+        # dist.new_group(range(W), backend=...) — sibling of the default
+        # group at MPI_COMM_WORLD, dedicated to world-level operations
+        # (e.g. ULFM consensus). shard_pg / replicate_pg are also
+        # MPI_COMM_WORLD-rooted siblings (PyTorch's new_group always
+        # validates ranks against the default group).
+        world_pg = dist.new_group(
+            ranks=list(range(world_size)),
+            backend=dist.get_backend(),
+        )
         shard_pg, replicate_pg, hsdp_layout = build_hsdp_groups(
             world_size=world_size, shard_size=shard_size, backend=args.backend
         )
@@ -455,6 +474,7 @@ def main(args):
             f"my shard_rank={hsdp_layout.shard_rank_of(global_rank)}"
         )
     else:
+        world_pg = None
         shard_pg = replicate_pg = hsdp_layout = None
 
     logger.info(
@@ -465,6 +485,12 @@ def main(args):
     device = f"cuda:{local_rank}"
 
     if _ULFM_AVAILABLE and not args.single_gpu and args.backend == "ulfm":
+        if args.ulfm_verbose:
+            import logging as _logging
+            ULFM.set_ulfm_verbose_logging(True)
+            _logging.getLogger("ulfm_collectives").setLevel(_logging.DEBUG)
+            if global_rank == 0:
+                logger.info("ULFM verbose logging enabled (C++ + Python DEBUG)")
         sim = _build_failure_simulator(args, world_size=world_size, shard_size=shard_size)
         if sim is not None:
             if global_rank == 0:
@@ -518,7 +544,7 @@ def main(args):
 
     if args.offline_mode:
         logger.info("Loading tokenized data from disk")
-        data = datasets.load_from_disk("/data/ziyueliu/datasets/c4/tokenized")
+        data = datasets.load_from_disk("/data/ziyueliu/datasets/.cache/huggingface/datasets/c4/tokenized/seq_len_4096")
         logger.info("Finished loading from disk")
     else:
         data = datasets.load_dataset("allenai/c4", "en", split="train", streaming=True)
@@ -615,7 +641,12 @@ def main(args):
             model = model.to(device=device)
 
     if args.activation_checkpointing:
-        model.gradient_checkpointing_enable()
+        # Non-reentrant: FSDP post-backward hook fires once per flat_param per
+        # backward. Reentrant mode can fire it multiple times, which breaks the
+        # sync-step fold in _reduce_grad (would double-count on the 2nd fire).
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
 
     if not args.single_gpu:
         wrap_policy = functools.partial(
@@ -823,19 +854,19 @@ def main(args):
                 optimizer.step()
                 optimizer.zero_grad()
         else:
-            if not stepped:
+            if world_pg is not None:
                 ulfm_opts = ULFM.ULFMOptions(auto_repair=True)
-                work = dist.group.WORLD.consensus(ulfm_opts)
+                work = world_pg.consensus(ulfm_opts)
                 work.wait()
             
             sim.begin_minibatch(batch_idx)
             with sim.may_fail_here("pre-forward"):
-                loss, stepped = training_manager.train_step(
-                    batch_idx, batch, None, lm_criterion, optimizer
+                loss, stepped, grad_norm = training_manager.train_step(
+                    batch_idx, batch, None, lm_criterion, optimizer,
+                    grad_clipping=args.grad_clipping,
                 )
             if not stepped:
                 continue
-            grad_norm = 0.0
 
         if global_rank == 0:
             logger.info(
@@ -846,6 +877,10 @@ def main(args):
             scheduler.step()
 
         update_step += 1
+        # Match nanotron: sync GPU before timing so iter_time includes all
+        # outstanding kernels (FSDP reshard, optimizer step, etc.).
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         update_time = time.time() - update_time
 
         # save checkpoint by save_every
@@ -930,18 +965,60 @@ def main(args):
         max_memory = torch.cuda.max_memory_allocated()
         torch.cuda.reset_peak_memory_stats()
 
+        # Nanotron-style throughput. Uses global_batch_size × seq_len (no pad
+        # adjustment) so values are directly comparable with nanotron runs.
+        elapsed_time_per_iteration_ms = update_time * 1000.0
+        tokens_per_iter = args.total_batch_size * args.max_length
+        tokens_per_sec = tokens_per_iter / update_time if update_time > 0 else 0.0
+        consumed_tokens = update_step * tokens_per_iter
+        # Live total GPUs: for ULFM, replicate_pg shrinks under failures while
+        # shard_pg stays stable (failures are per-replica). For NCCL it's static.
+        if args.backend == "ulfm" and training_manager is not None:
+            total_gpus = training_manager.txn.curr_world_size * shard_size
+        else:
+            total_gpus = world_size
+        tokens_per_sec_per_gpu = tokens_per_sec / total_gpus if total_gpus > 0 else 0.0
+
+        # ULFM-specific metrics (mirrors nanotron_ulfm trainer_ulfm.py:498-513).
+        ulfm_metrics = {}
+        if args.backend == "ulfm" and training_manager is not None:
+            txn = training_manager.txn
+            curr_grad_accum = txn.curr_grad_accum_steps
+            curr_dp_size = txn.curr_world_size
+            gbs = txn.effective_batch_size
+            total_workload = curr_dp_size * curr_grad_accum
+            redundancy = (
+                1.0 - (gbs / total_workload) if total_workload > 0 else 0.0
+            )
+            ulfm_metrics = {
+                "ulfm/num_majors": txn.num_major_procs,
+                "ulfm/num_minors": txn.num_minor_procs,
+                "ulfm/num_major_spares": txn.num_major_spare_procs,
+                "ulfm/num_minor_spares": txn.num_minor_spare_procs,
+                "ulfm/curr_grad_accum": curr_grad_accum,
+                "ulfm/curr_minor_grad_accum": txn.minor_proc_grad_accum_steps,
+                "ulfm/redundancy": redundancy,
+            }
+
         if global_rank == 0:
             wandb.log(
                 {
                     "loss": loss.item() if isinstance(loss, torch.Tensor) else loss,
                     "lr": lr,
                     "update_step": update_step,
+                    "consumed_tokens": consumed_tokens,
+                    "elapsed_time_per_iteration_ms": elapsed_time_per_iteration_ms,
+                    "tokens_per_sec": tokens_per_sec,
+                    "tokens_per_sec_per_gpu": tokens_per_sec_per_gpu,
+                    "total_gpus": total_gpus,
+                    "global_batch_size": args.total_batch_size,
                     "tokens_seen": tokens_seen,
                     "throughput_tokens": tokens_in_update / update_time,
                     "throughput_examples": args.total_batch_size / update_time,
                     "throughput_batches": batches_in_update / update_time,
                     "gradnorm": grad_norm,
                     "max_memory": max_memory,
+                    **ulfm_metrics,
                 },
                 step=global_step,
             )

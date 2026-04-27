@@ -11,7 +11,9 @@ no_sync, restore modes, optimizer commit — is inherited unchanged.
 
 import logging
 import contextlib
+import torch
 import torch.distributed as dist
+from torch.distributed.fsdp._traversal_utils import _get_fsdp_states
 
 import ulfm_collectives as ULFM
 from .training_manager import ULFMTrainingManager
@@ -48,6 +50,9 @@ class HSDPULFMTrainingManager(ULFMTrainingManager):
 
         self.failure_strategy = "continue"
         self.process_group = replicate_pg
+        # Derived world PG (sibling of replicate_pg / shard_pg, all rooted at
+        # MPI_COMM_WORLD), mirroring nanotron's ParallelContext.world_pg.
+        # Falls back to dist.group.WORLD (the default group) when not provided.
 
         policy = create_policy(
             policy_type=policy_type,
@@ -69,6 +74,14 @@ class HSDPULFMTrainingManager(ULFMTrainingManager):
         # FSDP1 provides all three.
         self.ddp_model = fsdp_model
 
+        # FSDP defaults to dividing grads by (shard × replicate). We keep its
+        # SHARD scaling (shard_pg is stable under our failure model — failures
+        # kill replicas, not shards) and strip out the replicate factor, so
+        # the parent's _get_grad_div_factor (= target_replicate × grad_accum
+        # under StaticWorldPolicy) is the only replicate-axis divisor and
+        # stays constant across rank failures.
+        self._strip_fsdp_replicate_scaling(fsdp_model)
+
         self._hook_state = HSDPHookState(pg=replicate_pg, orchestrator=self.txn)
         self._register_ulfm_hook(ulfm_opts=ulfm_opts)
 
@@ -79,6 +92,26 @@ class HSDPULFMTrainingManager(ULFMTrainingManager):
             f"policy={policy_type}, grad_accum={grad_accum_steps}"
         )
 
+    @staticmethod
+    def _strip_fsdp_replicate_scaling(fsdp_model) -> None:
+        """Set predivide=1, postdivide=shard_size on every FSDP unit so
+        FSDP divides only by the (stable) shard dimension; the replicate-axis
+        divisor is then applied solely by the parent's _get_grad_div_factor
+        (= target_replicate × grad_accum under StaticWorldPolicy, constant
+        across failures).
+        """
+        states = _get_fsdp_states(fsdp_model)
+        if not states:
+            raise RuntimeError("HSDP manager: no FSDP states found in model")
+        for state in states:
+            if state.process_group is None:
+                raise RuntimeError(
+                    "HSDP manager: FSDP state missing shard process_group"
+                )
+            shard_size = state.process_group.size()
+            state._gradient_predivide_factor = 1.0
+            state._gradient_postdivide_factor = float(shard_size)
+
     def _register_ulfm_hook(self, ulfm_opts):
         """Register the FSDP-shaped ULFM hook on the FSDP model."""
         hook = create_ulfm_hsdp_hook(ulfm_opts=ulfm_opts)
@@ -88,7 +121,7 @@ class HSDPULFMTrainingManager(ULFMTrainingManager):
         )
         self._hook = hook
 
-    def train_step(self, batch_idx, data, target, criterion, optimizer, scaler=None):
+    def train_step(self, batch_idx, data, target, criterion, optimizer, scaler=None, grad_clipping: float = 0.0):
         """Reset per-step unit counter, then delegate to the parent."""
         self._hook_state.reset_unit_counter()
         self.txn.update_progress(
@@ -171,6 +204,11 @@ class HSDPULFMTrainingManager(ULFMTrainingManager):
                 for p in self.ddp_model.parameters():
                     if p.grad is not None:
                         p.grad.div_(self._get_grad_div_factor())
+                if grad_clipping != 0.0:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.ddp_model.parameters(), grad_clipping
+                    )
+                grad_norm = self._compute_grad_norm()
                 optimizer.step()
             else:
                 if hasattr(scaler, "unscale_"):
@@ -178,6 +216,11 @@ class HSDPULFMTrainingManager(ULFMTrainingManager):
                 for p in self.ddp_model.parameters():
                     if p.grad is not None:
                         p.grad.div_(self._get_grad_div_factor())
+                if grad_clipping != 0.0:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.ddp_model.parameters(), grad_clipping
+                    )
+                grad_norm = self._compute_grad_norm()
                 scaler.step(optimizer)
                 scaler.update()
 
@@ -193,5 +236,16 @@ class HSDPULFMTrainingManager(ULFMTrainingManager):
         else:
             # Not at window boundary: continue accumulation
             self._micro_in_window += 1
+            grad_norm = 0.0
 
-        return float(loss.detach()), stepped
+        return float(loss.detach()), stepped, grad_norm
+
+    def _compute_grad_norm(self) -> float:
+        """Mirror the NCCL baseline's grad_norm: sum of per-param L2 norms on
+        each rank's local shards. Not a true global norm — kept identical to
+        baseline so wandb curves are comparable."""
+        total = 0.0
+        for p in self.ddp_model.parameters():
+            if p.grad is not None:
+                total += float(torch.norm(p.grad.detach()).cpu())
+        return total

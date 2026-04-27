@@ -182,7 +182,13 @@ class FailureSimulator:
         """
         with self._lock:
             self._state.step = step
-            self._state.armed_entry = None
+            # Don't unconditionally clear armed_entry — an arm whose scheduled
+            # step lands on a no_sync microstep (where the matching location
+            # never gets reached, e.g., "post-allreduce" with the fp32 fold
+            # that fires the hook only on sync microsteps) must persist into
+            # the next microbatch so the next sync-step hook can consume it.
+            # check(location) gates only on location, not step, so persisting
+            # is safe; new entries below still overwrite if scheduled.
 
             if not self.enabled or not self._initialized:
                 return
