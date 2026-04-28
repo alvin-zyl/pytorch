@@ -12,7 +12,9 @@ import torch.nn as nn
 import torch.utils.data
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel, MixedPrecision, ShardingStrategy
+from torch.distributed.fsdp import StateDictType
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+import torch.distributed.checkpoint as dcp
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
 import transformers
@@ -630,30 +632,27 @@ def main(args):
         )
         eval_dataloader = None
 
+    # Always build the architecture from --model_config. When resuming, we
+    # load weights AFTER FSDP wrapping via dcp.load (sharded distributed
+    # checkpoint), since save_every now writes sharded checkpoints — they
+    # are not directly loadable via HF from_pretrained.
     if args.continue_from is not None:
-
         logger.info("*" * 40)
-        logger.info(f"Loading model from {args.continue_from}")
-
-        model_config = AutoConfig.from_pretrained(args.continue_from)
-        model = AutoModelForCausalLM.from_pretrained(
-            args.continue_from, torch_dtype=torch.bfloat16
-        ).to(device=device)
-
-        logger.info(f"Model successfully loaded")
-    else:
-        logger.warning(
-            f"Did not find training state in {args.continue_from}, global step will start from zero"
+        logger.info(
+            f"Will resume from sharded checkpoint at {args.continue_from} "
+            "(architecture rebuilt from --model_config; weights loaded post-FSDP wrap)"
         )
+    else:
         logger.info("*" * 40)
+        logger.info("Building model from scratch")
 
-        model_config = AutoConfig.from_pretrained(args.model_config)
-        model = AutoModelForCausalLM.from_config(model_config)
-        
-        if args.dtype in ["bf16", "bfloat16"] and not args.mixed_precision:
-            model = model.to(device=device, dtype=torch.bfloat16)
-        else:
-            model = model.to(device=device)
+    model_config = AutoConfig.from_pretrained(args.model_config)
+    model = AutoModelForCausalLM.from_config(model_config)
+
+    if args.dtype in ["bf16", "bfloat16"] and not args.mixed_precision:
+        model = model.to(device=device, dtype=torch.bfloat16)
+    else:
+        model = model.to(device=device)
 
     if args.activation_checkpointing:
         # Non-reentrant: FSDP post-backward hook fires once per flat_param per
@@ -686,6 +685,30 @@ def main(args):
             mixed_precision=mp_policy,
         )
 
+    # Resume model weights from a sharded checkpoint. dcp.load is a
+    # collective — every rank must enter the state_dict_type and dcp.load
+    # block. The pattern: build a template state_dict by reading the current
+    # (freshly initialized) sharded params, hand it to dcp.load to overwrite
+    # in-place from disk, then load_state_dict to reapply.
+    if args.continue_from is not None:
+        if args.single_gpu:
+            sd = torch.load(
+                os.path.join(args.continue_from, "pytorch_model.bin"),
+                map_location="cpu",
+            )
+            model.load_state_dict(sd)
+        else:
+            with FullyShardedDataParallel.state_dict_type(
+                model, StateDictType.SHARDED_STATE_DICT
+            ):
+                sharded_sd = {"model": model.state_dict()}
+                dcp.load(
+                    state_dict=sharded_sd,
+                    storage_reader=dcp.FileSystemReader(args.continue_from),
+                )
+                model.load_state_dict(sharded_sd["model"])
+        logger.info(f"Loaded sharded model weights from {args.continue_from}")
+
     global_step = 0
     update_step = 0
     tokens_seen = 0
@@ -715,8 +738,28 @@ def main(args):
         optimizer_checkpoint = torch.load(
             os.path.join(args.continue_from, "optimizer.pt"), map_location="cpu"
         )
-        optimizer.load_state_dict(optimizer_checkpoint["optimizer"])
         scheduler.load_state_dict(optimizer_checkpoint["scheduler"])
+        # Load sharded optimizer state via FSDP's distributed API. Each rank
+        # reads its own shard from the dcp checkpoint dir; the result is
+        # rekeyed to flat-param ids and applied via optimizer.load_state_dict.
+        if args.single_gpu and "optimizer" in optimizer_checkpoint:
+            optimizer.load_state_dict(optimizer_checkpoint["optimizer"])
+        elif not args.single_gpu:
+            with FullyShardedDataParallel.state_dict_type(
+                model, StateDictType.SHARDED_STATE_DICT
+            ):
+                optim_template = FullyShardedDataParallel.optim_state_dict(
+                    model, optimizer
+                )
+                state_dict_to_load = {"optim": optim_template}
+                dcp.load(
+                    state_dict=state_dict_to_load,
+                    storage_reader=dcp.FileSystemReader(args.continue_from),
+                )
+                flattened_osd = FullyShardedDataParallel.optim_state_dict_to_load(
+                    model, optimizer, state_dict_to_load["optim"]
+                )
+                optimizer.load_state_dict(flattened_osd)
         logger.info(f"Optimizer and scheduler restored from {args.continue_from}")
 
         if os.path.exists(os.path.join(args.continue_from, "training_state.json")):
@@ -988,47 +1031,73 @@ def main(args):
         update_time = time.time() - update_time
 
         # save checkpoint by save_every
+        # Sharded distributed checkpoint: each rank writes its own shard
+        # to the same directory. No single rank holds the full model in
+        # memory. Resume via dcp.load with the same FSDP wrapping.
         if (
             local_step > args.gradient_accumulation
             and update_step % args.save_every == 0
-            and global_rank == 0
         ):
             current_model_directory = f"{args.save_dir}/model_{update_step}"
-            logger.info(
-                f"Saving model and optimizer to {current_model_directory}, update step {update_step}"
-            )
-            os.makedirs(args.save_dir, exist_ok=True)
-            model.save_pretrained(
-                current_model_directory, max_shard_size="100GB"
-            )
+            if global_rank == 0:
+                logger.info(
+                    f"Saving sharded model checkpoint to {current_model_directory}, update step {update_step}"
+                )
+                os.makedirs(current_model_directory, exist_ok=True)
+            if not args.single_gpu:
+                dist.barrier()  # ensure dir exists before all ranks write
 
-            optimizer_checkpoint = {
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "update_step": update_step,
-                "global_step": global_step,
-                "config": run_config,
-                "wandb": wandb.run.dir,
-                "dtype": args.dtype,
-            }
-            torch.save(optimizer_checkpoint, f"{current_model_directory}/optimizer.pt")
+            if args.single_gpu:
+                # No FSDP — single rank, save HF-style.
+                model.save_pretrained(
+                    current_model_directory, max_shard_size="100GB"
+                )
+            else:
+                # All ranks must enter state_dict_type, optim_state_dict, and
+                # dcp.save (collective). Sharded model + sharded optimizer.
+                with FullyShardedDataParallel.state_dict_type(
+                    model, StateDictType.SHARDED_STATE_DICT
+                ):
+                    sharded_sd = {
+                        "model": model.state_dict(),
+                        "optim": FullyShardedDataParallel.optim_state_dict(
+                            model, optimizer
+                        ),
+                    }
+                dcp.save(
+                    state_dict=sharded_sd,
+                    storage_writer=dcp.FileSystemWriter(current_model_directory),
+                )
 
-            training_state_checkpoint = {
-                "global_step": global_step,
-                "update_step": update_step,
-                "tokens_seen": tokens_seen,
-                "tokens_seen_before": tokens_seen_before,
-                "update_time": update_time,
-            }
-            with open(f"{current_model_directory}/training_state.json", "w") as f:
-                json.dump(training_state_checkpoint, f, indent=4)
+            # Scheduler + training metadata are small — keep rank-0-only.
+            # Optimizer state lives in the sharded dcp checkpoint above.
+            if global_rank == 0:
+                optimizer_checkpoint = {
+                    "scheduler": scheduler.state_dict(),
+                    "update_step": update_step,
+                    "global_step": global_step,
+                    "config": run_config,
+                    "wandb": wandb.run.dir,
+                    "dtype": args.dtype,
+                }
+                torch.save(optimizer_checkpoint, f"{current_model_directory}/optimizer.pt")
 
-            # save wandb related info
-            wandb_info = {
-                "wandb_id": wandb.run.id,
-            }
-            with open(f"{args.save_dir}/wandb.json", "w") as f:
-                json.dump(wandb_info, f, indent=4)
+                training_state_checkpoint = {
+                    "global_step": global_step,
+                    "update_step": update_step,
+                    "tokens_seen": tokens_seen,
+                    "tokens_seen_before": tokens_seen_before,
+                    "update_time": update_time,
+                }
+                with open(f"{current_model_directory}/training_state.json", "w") as f:
+                    json.dump(training_state_checkpoint, f, indent=4)
+
+                # save wandb related info
+                wandb_info = {
+                    "wandb_id": wandb.run.id,
+                }
+                with open(f"{args.save_dir}/wandb.json", "w") as f:
+                    json.dump(wandb_info, f, indent=4)
 
         # evaluation
         if update_step % args.eval_every == 0:
@@ -1135,16 +1204,37 @@ def main(args):
     logger.info("Training finished")
 
     current_model_directory = f"{args.save_dir}/model_{update_step}"
-    if global_rank == 0 and not os.path.exists(current_model_directory):
+    # Final sharded save: all ranks must enter the FSDP state_dict_type and
+    # dcp.save (collective). The directory + log are rank-0-only.
+    save_final = not os.path.exists(current_model_directory)
+    if save_final and global_rank == 0:
         logger.info(
-            f"Saving model and optimizer to {current_model_directory}, update step {update_step}"
+            f"Saving final sharded model checkpoint to {current_model_directory}, update step {update_step}"
         )
-        os.makedirs(args.save_dir, exist_ok=True)
+        os.makedirs(current_model_directory, exist_ok=True)
+    if save_final and not args.single_gpu:
+        dist.barrier()
+        with FullyShardedDataParallel.state_dict_type(
+            model, StateDictType.SHARDED_STATE_DICT
+        ):
+            sharded_sd = {
+                "model": model.state_dict(),
+                "optim": FullyShardedDataParallel.optim_state_dict(
+                    model, optimizer
+                ),
+            }
+        dcp.save(
+            state_dict=sharded_sd,
+            storage_writer=dcp.FileSystemWriter(current_model_directory),
+        )
+    elif save_final and args.single_gpu and global_rank == 0:
+        model.save_pretrained(current_model_directory)
 
-        model.module.save_pretrained(current_model_directory)
+    if save_final and global_rank == 0:
 
+        # Optimizer state lives in the sharded dcp checkpoint above; only
+        # save scheduler + metadata here.
         optimizer_checkpoint = {
-            "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "update_step": update_step,
             "global_step": global_step,
